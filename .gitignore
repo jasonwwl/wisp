@@ -1,0 +1,35 @@
+# Binaries
+/bin/
+/dist/
+/wisp
+/wisp-*
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
+
+# Local config / secrets
+*.local.*
+.env
+.env.*
+!.env.example
+certs/
+*.pem
+*.key
+*.crt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
