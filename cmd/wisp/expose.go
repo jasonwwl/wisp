@@ -8,11 +8,13 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/jasonwwl/wisp/internal/client"
 	"github.com/jasonwwl/wisp/internal/protocol"
+	"github.com/jasonwwl/wisp/internal/shape"
 )
 
 type exposeOpts struct {
@@ -23,6 +25,7 @@ type exposeOpts struct {
 	ttl      time.Duration
 	resume   string
 	noResume bool
+	shape    string
 	detach   bool
 	insecure bool
 	verbose  bool
@@ -39,6 +42,7 @@ func exposeFlags(opts *exposeOpts) *flag.FlagSet {
 	fs.DurationVar(&opts.ttl, "ttl", time.Hour, "tunnel time-to-live")
 	fs.StringVar(&opts.resume, "resume", "", "attach to a previous session id (must still be inside the server's resume window)")
 	fs.BoolVar(&opts.noResume, "no-resume", false, "disable auto-resume on transient disconnects (v0.1 behaviour)")
+	fs.StringVar(&opts.shape, "shape", "none", "traffic shaping: comma-separated subset of {burst,chaff,all,none}")
 	fs.BoolVar(&opts.detach, "detach", false, "re-exec as a background daemon; closing the terminal does not stop the tunnel")
 	fs.BoolVar(&opts.insecure, "insecure-dev", false, "skip TLS verification (development only)")
 	fs.BoolVar(&opts.verbose, "verbose", false, "enable debug logging")
@@ -85,6 +89,11 @@ func runExpose(args []string, stdout, stderr io.Writer) error {
 		initialMode = protocol.HelloModeResume
 	}
 
+	shapeMode, err := parseShape(opts.shape)
+	if err != nil {
+		return err
+	}
+
 	sess, err := client.Dial(ctx, client.Config{
 		Server:             opts.server,
 		Endpoint:           opts.endpoint,
@@ -94,6 +103,7 @@ func runExpose(args []string, stdout, stderr io.Writer) error {
 		SessionID:          opts.resume,
 		InitialMode:        initialMode,
 		AutoResume:         !opts.noResume,
+		Shape:              shapeMode,
 		InsecureSkipVerify: opts.insecure,
 		Logger:             logger,
 	})
@@ -132,6 +142,33 @@ func runExpose(args []string, stdout, stderr io.Writer) error {
 		)
 	}
 	return sess.Run(ctx)
+}
+
+// parseShape turns the --shape flag string into a shape.Mode. Empty or
+// "none" yields the zero Mode (pass-through). Otherwise it's a comma-
+// separated subset of {burst, chaff, all}. Unknown tokens are an error.
+func parseShape(s string) (shape.Mode, error) {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "none" {
+		return shape.Mode{}, nil
+	}
+	var m shape.Mode
+	for v := range strings.SplitSeq(s, ",") {
+		switch strings.TrimSpace(v) {
+		case "", "none":
+			// silently allowed mixed with other tokens
+		case "burst":
+			m.Burst = true
+		case "chaff":
+			m.Chaff = true
+		case "all":
+			m.Burst = true
+			m.Chaff = true
+		default:
+			return shape.Mode{}, fmt.Errorf("unknown --shape value %q (want one of: none, burst, chaff, all)", v)
+		}
+	}
+	return m, nil
 }
 
 func hostOnly(hostPort string) string {

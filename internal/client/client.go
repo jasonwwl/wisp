@@ -25,6 +25,7 @@ import (
 	"github.com/jasonwwl/wisp/internal/frame"
 	"github.com/jasonwwl/wisp/internal/mux"
 	"github.com/jasonwwl/wisp/internal/protocol"
+	"github.com/jasonwwl/wisp/internal/shape"
 	"github.com/jasonwwl/wisp/internal/wsraw"
 )
 
@@ -78,6 +79,12 @@ type Config struct {
 	// any non-OK ack from the server is terminal (a re-attempt cannot
 	// succeed since the server's view is authoritative).
 	AutoResume bool
+
+	// Shape selects traffic-shaping primitives applied to the outbound
+	// wsraw write path. Zero value (both bits false) is v0.1 pass-through.
+	// Burst coalesces small frames within a short window; Chaff emits
+	// low-rate dummy frames during idle periods. See docs/design.md §7.
+	Shape shape.Mode
 
 	// InsecureSkipVerify disables TLS certificate verification.
 	// Development use only.
@@ -227,7 +234,15 @@ func Dial(ctx context.Context, cfg Config) (*Session, error) {
 	_ = wsc.SetWriteDeadline(time.Time{})
 
 	// Build yamux client session on top of the wsraw conn.
-	adapter := mux.New(wsc, 64, "server")
+	var adapter *mux.Adapter
+	if cfg.Shape.Empty() {
+		adapter = mux.New(wsc, 64, "server")
+	} else {
+		adapter = mux.NewWithShape(wsc, 64, "server", shape.Config{
+			Mode:       cfg.Shape,
+			MaxPayload: frame.MaxPayload - 64, // leave headroom for header + padding
+		})
+	}
 	ycfg := yamux.DefaultConfig()
 	ycfg.LogOutput = io.Discard
 	ycfg.EnableKeepAlive = true

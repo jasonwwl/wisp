@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/jasonwwl/wisp/internal/frame"
+	"github.com/jasonwwl/wisp/internal/shape"
 	"github.com/jasonwwl/wisp/internal/wsraw"
 )
 
@@ -32,10 +33,16 @@ import (
 // another, matching yamux's expectation of an independent reader and
 // writer loop. Multiple concurrent calls to Read (or to Write) are
 // serialized internally.
+//
+// When a shaper is attached (NewWithShape) it sits in front of the
+// write path: yamux frames go to shaper.Write, which decides whether
+// to forward immediately or coalesce within a burst window. The
+// shaper also drives idle-period chaff via SendChaff.
 type Adapter struct {
 	conn       *wsraw.Conn
 	padding    int
 	remoteName string
+	shaper     *shape.Shaper // nil = pass-through
 
 	readMu  sync.Mutex
 	readBuf bytes.Buffer
@@ -48,6 +55,17 @@ type Adapter struct {
 // remoteName is shown in LocalAddr/RemoteAddr for log readability;
 // it does not affect the wire.
 func New(conn *wsraw.Conn, padTarget int, remoteName string) *Adapter {
+	return newAdapter(conn, padTarget, remoteName, shape.Config{})
+}
+
+// NewWithShape returns an Adapter that routes outbound bytes through a
+// Shaper configured by cfg. When cfg.Mode is empty this is equivalent
+// to New.
+func NewWithShape(conn *wsraw.Conn, padTarget int, remoteName string, cfg shape.Config) *Adapter {
+	return newAdapter(conn, padTarget, remoteName, cfg)
+}
+
+func newAdapter(conn *wsraw.Conn, padTarget int, remoteName string, cfg shape.Config) *Adapter {
 	if padTarget < 0 {
 		padTarget = 0
 	}
@@ -57,7 +75,14 @@ func New(conn *wsraw.Conn, padTarget int, remoteName string) *Adapter {
 	if remoteName == "" {
 		remoteName = "wisp"
 	}
-	return &Adapter{conn: conn, padding: padTarget, remoteName: remoteName}
+	a := &Adapter{conn: conn, padding: padTarget, remoteName: remoteName}
+	if !cfg.Mode.Empty() {
+		if cfg.MaxPayload <= 0 {
+			cfg.MaxPayload = frame.MaxPayload
+		}
+		a.shaper = shape.New(cfg, a)
+	}
+	return a
 }
 
 // Read implements net.Conn. It returns bytes carried in wisp.Frame
@@ -94,8 +119,11 @@ func (a *Adapter) Read(p []byte) (int, error) {
 	return a.readBuf.Read(p)
 }
 
-// Write implements net.Conn. Every Write call results in exactly one
-// wsraw binary message carrying a wisp.Frame{Type=Yamux}.
+// Write implements net.Conn. Without shaping, every Write produces
+// exactly one wsraw binary message carrying a wisp.Frame{Type=Yamux}.
+// With burst shaping, multiple Writes may coalesce into one wisp
+// frame; the byte stream as seen by the peer's yamux is identical
+// either way.
 //
 // We do NOT chunk p across multiple wisp frames here even if p exceeds
 // frame.MaxPayload — that would corrupt yamux's framing assumptions.
@@ -105,22 +133,52 @@ func (a *Adapter) Write(p []byte) (int, error) {
 	if len(p) > frame.MaxPayload {
 		return 0, fmt.Errorf("mux: write of %d bytes exceeds wisp frame max %d", len(p), frame.MaxPayload)
 	}
-	a.writeMu.Lock()
-	defer a.writeMu.Unlock()
-
-	f := frame.Frame{Type: frame.TypeYamux, Payload: p}
-	var buf bytes.Buffer
-	if err := f.Encode(&buf, a.padding); err != nil {
-		return 0, err
+	if a.shaper != nil {
+		if err := a.shaper.Write(p); err != nil {
+			return 0, err
+		}
+		return len(p), nil
 	}
-	if err := a.conn.WriteMessage(buf.Bytes()); err != nil {
+	if err := a.SendData(p); err != nil {
 		return 0, err
 	}
 	return len(p), nil
 }
 
-// Close implements net.Conn.
-func (a *Adapter) Close() error { return a.conn.Close() }
+// SendData implements shape.Sender: emit p as a single TypeYamux frame.
+func (a *Adapter) SendData(p []byte) error {
+	a.writeMu.Lock()
+	defer a.writeMu.Unlock()
+	f := frame.Frame{Type: frame.TypeYamux, Payload: p}
+	var buf bytes.Buffer
+	if err := f.Encode(&buf, a.padding); err != nil {
+		return err
+	}
+	return a.conn.WriteMessage(buf.Bytes())
+}
+
+// SendChaff implements shape.Sender: emit p as a single TypePing frame.
+// The peer's mux absorbs Ping frames at the read side, so chaff never
+// reaches yamux.
+func (a *Adapter) SendChaff(p []byte) error {
+	a.writeMu.Lock()
+	defer a.writeMu.Unlock()
+	f := frame.Frame{Type: frame.TypePing, Payload: p}
+	var buf bytes.Buffer
+	if err := f.Encode(&buf, a.padding); err != nil {
+		return err
+	}
+	return a.conn.WriteMessage(buf.Bytes())
+}
+
+// Close implements net.Conn. It drains the shaper (if any) before
+// closing the underlying connection.
+func (a *Adapter) Close() error {
+	if a.shaper != nil {
+		_ = a.shaper.Close()
+	}
+	return a.conn.Close()
+}
 
 // LocalAddr and RemoteAddr return synthetic addresses with network
 // "wisp"; they exist to satisfy net.Conn for yamux's debug logging.

@@ -145,9 +145,6 @@ These are intentionally not in v0.1, and not all are done yet in v0.2:
 
 - **HELLO nonce verification.** The server reads it but doesn't yet
   bind subsequent frames to it.
-- **`--shape burst` / `--shape chaff`.** Padding is on by default;
-  burst-smoothing and chaff frames need an interactive workload (SSH)
-  to validate against.
 - **Windows `--detach`.** Re-exec with `DETACHED_PROCESS` works but
   needs `golang.org/x/sys/windows`; not yet worth adding.
 - **HTTP/2 RFC 8441 transport.** See pitfall above.

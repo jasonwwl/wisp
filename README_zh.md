@@ -204,11 +204,14 @@ $ sudo systemctl enable --now wisp
 - **从 v0.1 起在 `main` 上落地(将作为 v0.2 发布):**
   - 5 分钟会话恢复窗口:网络抖动不掉隧道,重连后是同一个公网端口。
     `--no-resume` 可退回 v0.1 行为
+  - 流量整形 opt-in: `--shape burst` 在 10ms 窗口内合并 yamux 帧(平滑
+    SSH 击键节奏);`--shape chaff` 空闲时低速发零负载 Ping 帧(掩盖
+    "长静默后突发"模式)。默认都不开;`--shape burst,chaff` 或
+    `--shape all` 同时打开
 
 仍然推迟的:
 
 - HELLO nonce 验证
-- 流量整形 `--shape burst` 和 `--shape chaff`
 - Windows 下 `--detach`
 - HTTP/2 RFC 8441 WebSocket 传输(当前只有 HTTP/1.1)
 
