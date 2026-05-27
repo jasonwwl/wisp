@@ -3,12 +3,15 @@
 > Ephemeral reverse TCP tunnels. One line. TLS by default. TTL-bound. No config files.
 
 ```bash
-# On a public host you control:
-wisp serve --domain wisp.example.com --token $TOKEN
+# On a public host you control (one-time):
+$ wisp serve --listen :443 --domain wisp.example.com \
+    --acme --acme-email you@example.com --token $WISP_TOKEN
 
 # On the machine behind NAT, when you need help for an hour:
-curl -sSL https://wisp.example.com/w | sh -s -- --to 127.0.0.1:22 --ttl 1h
-# → exposed at wisp.example.com:22017
+$ wisp expose -s wisp.example.com -t $WISP_TOKEN \
+    -e <endpoint-from-server> --to 127.0.0.1:22 --ttl 1h --detach
+# → wisp: tunnel started in background
+#   public:  wisp.example.com:22017
 ```
 
 That's it. When the timer is up, the tunnel evaporates.
@@ -41,17 +44,15 @@ A self-hostable, single-binary, TLS-tunneled reverse TCP relay with
   "forever" mode.
 - **Zero configuration.** No `wisp.toml`, no `[proxies]` block, no
   registry. Everything is command-line flags or environment variables.
-- **TLS on 443, real certificate.** Looks and behaves like an HTTPS
-  endpoint. No stunnel, no nginx in front, no `-k` to swallow self-signed
-  warnings.
+- **TLS on 443, real certificate.** Built-in ACME / Let's Encrypt
+  issuance and renewal — `--acme` on the server, nothing else. Looks
+  and behaves like an HTTPS endpoint. No stunnel, no nginx in front,
+  no `-k` to swallow self-signed warnings.
 - **Foreground by default; `--detach` when you need it.** Run wisp in
   the foreground and stop it with `Ctrl-C`; or add `--detach` to fork
   it into a real daemon that survives the parent terminal — useful in
   vendor web terminals or captive bastion sessions where closing the
   browser tab would otherwise kill the process.
-- **Session resume.** Lost your SSH? Re-run the same command with
-  `--resume <id>` within five minutes and you get the same public port
-  back.
 - **Not just SSH.** The client forwards any local TCP target. Postgres,
   Redis, an HTTP dev server — `--to` takes a `host:port`.
 
@@ -72,19 +73,140 @@ A self-hostable, single-binary, TLS-tunneled reverse TCP relay with
 
 ## Quick start
 
-> Coming soon — pinned in the next release.
+### Build
+
+```bash
+git clone https://github.com/jasonwwl/wisp && cd wisp
+make build
+# → ./bin/wisp
+```
+
+Or cross-compile a release set: `make release` (linux/darwin/windows
+amd64 + arm64, ~9 MB each).
+
+### Deploy the server (public host)
+
+A. **Production — Let's Encrypt, zero-maintenance certs:**
+
+```bash
+# DNS: A record for wisp.example.com → server IP
+# Open inbound TCP 80 (HTTP-01 challenge) and 443 (TLS).
+$ sudo setcap CAP_NET_BIND_SERVICE=+eip ./wisp   # let it bind 80 + 443
+$ export WISP_TOKEN=$(openssl rand -base64 32)
+$ ./wisp serve \
+    --listen :443 \
+    --domain wisp.example.com \
+    --acme --acme-email you@example.com \
+    --token $WISP_TOKEN
+wisp server listening on :443 (domain wisp.example.com)
+  endpoint: ULsykonosAZGj5ZpyoSDDmfE_sXZpY--wXNPoFdfLyw
+  client:   wisp expose --server wisp.example.com --endpoint ... --token $WISP_TOKEN ...
+```
+
+The first hit to `https://wisp.example.com/` will take ~10s while
+ACME issues the cert; after that it's instant. Renewals happen
+automatically about 30 days before expiry.
+
+B. **Self-managed cert (corporate CA, Caddy reverse-proxy, etc.):**
+
+```bash
+$ ./wisp serve --listen :443 --domain wisp.example.com \
+    --cert /etc/wisp/cert.pem --key /etc/wisp/key.pem --token $WISP_TOKEN
+```
+
+C. **Local development:**
+
+```bash
+$ ./wisp serve --listen 127.0.0.1:8443 --domain localhost \
+    --tls-self-signed --token dev
+# client must pass --insecure-dev
+```
+
+### Use it from the inside
+
+Foreground (your terminal stays attached, `Ctrl-C` to stop):
+
+```bash
+$ ./wisp expose -s wisp.example.com -t $WISP_TOKEN \
+    -e ULsykonos... --to 127.0.0.1:22 --ttl 1h
+wisp: tunnel up
+  public:  wisp.example.com:22017
+  session: a28iBDFg7kbXiTqndfaIPdmAiq_Xg3lcnwj8_P-811E
+  ttl:     1h0m0s
+Ctrl-C to stop.
+```
+
+Detached (the only sane mode inside a vendor web terminal where
+closing the tab would otherwise kill the process):
+
+```bash
+$ ./wisp expose ... --detach
+wisp: tunnel started in background
+  pid:     2972313
+  public:  wisp.example.com:22017
+  log:     ~/.wisp/wisp-20260527-120031.log
+  stop:    kill 2972313
+```
+
+### Optional: systemd unit for the server
+
+```ini
+# /etc/systemd/system/wisp.service
+[Unit]
+Description=wisp tunnel server
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/wisp serve \
+  --listen :443 --domain wisp.example.com \
+  --acme --acme-email you@example.com
+EnvironmentFile=/etc/wisp/env       # contains WISP_TOKEN=...
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+DynamicUser=yes
+StateDirectory=wisp                  # /var/lib/wisp/ for acme-cache
+Environment=HOME=/var/lib/wisp
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+$ sudo systemctl enable --now wisp
+```
 
 ## Design
 
 See [`docs/design.md`](docs/design.md) for the wire protocol, threat
-model, traffic-shaping strategy, daemonization, and session-resume
-semantics. Read it before opening a PR that touches anything below
-the CLI.
+model, traffic-shaping strategy, daemonization, and resume semantics.
+Read it before opening a PR that touches anything below the CLI.
 
 ## Status
 
-Pre-alpha. Design is being prototyped in public; expect breaking changes
-until `v0.1.0`.
+**Alpha.** Real deployments work end-to-end on Linux (server +
+client). Public API will not break gratuitously but may move before
+`v1.0`.
+
+Working:
+
+- TLS-1.3-on-443 with ACME-issued certificates that auto-renew
+- uTLS browser ClientHello (Chrome / Firefox / Safari / Edge)
+- Decoy nginx-style site at `/`, indistinguishable 404 on the
+  tunnel endpoint without a valid token
+- HELLO / HELLO_ACK over wisp.Frame envelopes
+- yamux-multiplexed many-streams-per-tunnel forwarding
+- Server-side port allocator (fixed range or kernel-ephemeral)
+- TTL enforcement with orderly BYE
+- Unix `--detach` daemonization that survives PTY close
+
+Deferred to `v0.2`:
+
+- 5-minute session resume window
+- HELLO nonce verification
+- Traffic-shape `--shape burst` and `--shape chaff`
+- Windows `--detach`
+- HTTP/2 RFC 8441 WebSocket transport (current is HTTP/1.1 only)
 
 ## License
 
