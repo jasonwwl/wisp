@@ -1,3 +1,3 @@
-module github.com/wenleigood/wisp
+module github.com/jasonwwl/wisp
 
 go 1.22

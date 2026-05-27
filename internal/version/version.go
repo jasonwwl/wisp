@@ -2,8 +2,8 @@
 //
 // At release time the linker overrides Tag and Commit via -ldflags:
 //
-//	go build -ldflags="-X github.com/wenleigood/wisp/internal/version.Tag=v0.1.0 \
-//	                   -X github.com/wenleigood/wisp/internal/version.Commit=$(git rev-parse --short HEAD)"
+//	go build -ldflags="-X github.com/jasonwwl/wisp/internal/version.Tag=v0.1.0 \
+//	                   -X github.com/jasonwwl/wisp/internal/version.Commit=$(git rev-parse --short HEAD)"
 package version
 
 import (

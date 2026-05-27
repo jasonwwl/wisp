@@ -10,7 +10,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/wenleigood/wisp/internal/version"
+	"github.com/jasonwwl/wisp/internal/version"
 )
 
 const rootUsage = `wisp — ephemeral reverse TCP tunnels.
@@ -25,7 +25,7 @@ Commands:
   help       Show help for a command.
 
 Run "wisp help <command>" for command-specific flags.
-See https://github.com/wenleigood/wisp for documentation.
+See https://github.com/jasonwwl/wisp for documentation.
 `
 
 func main() {

@@ -1,5 +1,5 @@
 GO       ?= go
-PKG      := github.com/wenleigood/wisp
+PKG      := github.com/jasonwwl/wisp
 GOFLAGS  ?= -trimpath
 LDFLAGS  ?= -s -w -buildid=
 BIN      ?= bin
