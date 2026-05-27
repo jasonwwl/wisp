@@ -102,7 +102,7 @@ func TestE2E_HandshakeAndMessage(t *testing.T) {
 
 	handlerCh := make(chan error, 1)
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := AcceptUpgrade(w, r)
+		conn, _, err := AcceptUpgrade(w, r)
 		if err != nil {
 			handlerCh <- err
 			return
@@ -158,7 +158,7 @@ func TestE2E_PingPong(t *testing.T) {
 	}
 
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := AcceptUpgrade(w, r)
+		conn, _, err := AcceptUpgrade(w, r)
 		if err != nil {
 			return
 		}

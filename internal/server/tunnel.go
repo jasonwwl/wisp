@@ -23,9 +23,18 @@ func (s *Server) tunnelHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, err := wsraw.AcceptUpgrade(w, r)
+	conn, hijacked, err := wsraw.AcceptUpgrade(w, r)
 	if err != nil {
-		log.Warn("ws upgrade failed", "err", err)
+		log.Warn("ws upgrade failed", "err", err, "hijacked", hijacked)
+		if !hijacked {
+			// Still own the response writer: respond like the decoy 404.
+			// This prevents an HTTP/2 probe (or any malformed upgrade) from
+			// leaking a distinguishable "weird 200" or default error page.
+			w.Header().Set("Server", "nginx/1.24.0")
+			w.Header().Set("Content-Type", "text/html; charset=UTF-8")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(builtinNotFound))
+		}
 		return
 	}
 	defer conn.Close()

@@ -22,6 +22,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 )
 
 const magicGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -112,6 +113,25 @@ func (c *Conn) ReadMessage() ([]byte, error) {
 // WriteMessage writes one complete binary message.
 func (c *Conn) WriteMessage(b []byte) error {
 	return c.writeFrame(OpBinary, b)
+}
+
+// SetReadDeadline sets a deadline for the next ReadMessage. A zero value
+// disables the deadline. If the underlying transport does not support
+// deadlines, this is a no-op and returns nil.
+func (c *Conn) SetReadDeadline(t time.Time) error {
+	if d, ok := c.rwc.(interface{ SetReadDeadline(time.Time) error }); ok {
+		return d.SetReadDeadline(t)
+	}
+	return nil
+}
+
+// SetWriteDeadline sets a deadline for the next WriteMessage. See
+// SetReadDeadline for semantics.
+func (c *Conn) SetWriteDeadline(t time.Time) error {
+	if d, ok := c.rwc.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		return d.SetWriteDeadline(t)
+	}
+	return nil
 }
 
 // Close sends an empty close frame (best-effort) and closes the underlying
@@ -241,36 +261,51 @@ func writeFrame(w io.Writer, op Opcode, payload []byte, mask bool) error {
 
 // --- server-side handshake ---
 
-// AcceptUpgrade performs the server-side WebSocket handshake against an
-// http.ResponseWriter that supports http.Hijacker. On success it returns a
-// Conn ready for binary messaging.
-func AcceptUpgrade(w http.ResponseWriter, r *http.Request) (*Conn, error) {
+// AcceptUpgrade performs the server-side WebSocket handshake.
+//
+// It returns:
+//   - conn: the upgraded connection on success.
+//   - hijacked: true once the underlying TCP connection has been taken
+//     over from the http.Server (the caller must NOT write further to w
+//     after that point). When false, the caller is free to send an HTTP
+//     response (e.g. a 404 indistinguishable from the decoy site).
+//   - err: non-nil on any failure.
+//
+// Handshake failures that happen before hijack (HTTP/2 — Hijacker
+// unavailable, bad method, missing/garbage WS headers) leave the
+// response writer usable so the caller can mimic the decoy site instead
+// of leaking a "weird 200" fingerprint.
+func AcceptUpgrade(w http.ResponseWriter, r *http.Request) (conn *Conn, hijacked bool, err error) {
 	if r.Method != http.MethodGet {
-		return nil, fmt.Errorf("%w: method %s", ErrBadHandshake, r.Method)
+		return nil, false, fmt.Errorf("%w: method %s", ErrBadHandshake, r.Method)
 	}
 	if !headerContainsToken(r.Header, "Connection", "upgrade") {
-		return nil, fmt.Errorf("%w: missing Connection: upgrade", ErrBadHandshake)
+		return nil, false, fmt.Errorf("%w: missing Connection: upgrade", ErrBadHandshake)
 	}
 	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-		return nil, fmt.Errorf("%w: missing Upgrade: websocket", ErrBadHandshake)
+		return nil, false, fmt.Errorf("%w: missing Upgrade: websocket", ErrBadHandshake)
 	}
 	if r.Header.Get("Sec-WebSocket-Version") != "13" {
-		return nil, fmt.Errorf("%w: bad WS version", ErrBadHandshake)
+		return nil, false, fmt.Errorf("%w: bad WS version", ErrBadHandshake)
 	}
 	key := r.Header.Get("Sec-WebSocket-Key")
 	if key == "" {
-		return nil, fmt.Errorf("%w: missing Sec-WebSocket-Key", ErrBadHandshake)
+		return nil, false, fmt.Errorf("%w: missing Sec-WebSocket-Key", ErrBadHandshake)
 	}
 
+	// Hijacker is unavailable on HTTP/2; this is the most common
+	// pre-hijack failure path and the one we explicitly want callers to
+	// dress up as a decoy 404.
 	hj, ok := w.(http.Hijacker)
 	if !ok {
-		return nil, fmt.Errorf("%w: ResponseWriter is not a Hijacker", ErrBadHandshake)
+		return nil, false, fmt.Errorf("%w: ResponseWriter is not a Hijacker (HTTP/2?)", ErrBadHandshake)
 	}
 
 	netConn, brw, err := hj.Hijack()
 	if err != nil {
-		return nil, fmt.Errorf("hijack: %w", err)
+		return nil, false, fmt.Errorf("hijack: %w", err)
 	}
+	// From here on, the response writer is dead; we own netConn.
 
 	resp := "HTTP/1.1 101 Switching Protocols\r\n" +
 		"Server: nginx/1.24.0\r\n" +
@@ -278,16 +313,16 @@ func AcceptUpgrade(w http.ResponseWriter, r *http.Request) (*Conn, error) {
 		"Connection: Upgrade\r\n" +
 		"Sec-WebSocket-Accept: " + Accept(key) + "\r\n" +
 		"\r\n"
-	if _, err := brw.WriteString(resp); err != nil {
+	if _, werr := brw.WriteString(resp); werr != nil {
 		_ = netConn.Close()
-		return nil, fmt.Errorf("write 101: %w", err)
+		return nil, true, fmt.Errorf("write 101: %w", werr)
 	}
-	if err := brw.Flush(); err != nil {
+	if ferr := brw.Flush(); ferr != nil {
 		_ = netConn.Close()
-		return nil, fmt.Errorf("flush 101: %w", err)
+		return nil, true, fmt.Errorf("flush 101: %w", ferr)
 	}
 
-	return NewServerConn(netConn), nil
+	return NewServerConn(netConn), true, nil
 }
 
 // --- client-side dial ---
@@ -322,6 +357,14 @@ func Dial(opts DialOptions) (*Conn, error) {
 	if tlsCfg.ServerName == "" {
 		tlsCfg.ServerName = u.Hostname()
 	}
+	// Browsers performing a WebSocket upgrade only negotiate http/1.1 at
+	// ALPN time: they know they will need Connection: Upgrade semantics,
+	// which HTTP/2 does not provide (RFC 8441 is rarely supported).
+	// Matching this avoids the "empty ALPN" fingerprint that Go's default
+	// TLS client would otherwise expose.
+	if tlsCfg.NextProtos == nil {
+		tlsCfg.NextProtos = []string{"http/1.1"}
+	}
 
 	tcpConn, err := tls.Dial("tcp", host, tlsCfg)
 	if err != nil {
@@ -340,14 +383,25 @@ func Dial(opts DialOptions) (*Conn, error) {
 		ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 	}
 
+	// Header order and contents below mirror a current Chrome WebSocket
+	// upgrade. Static fingerprint tools cluster by exactly these headers
+	// (presence, order, casing). Sec-WebSocket-Extensions is sent for
+	// authenticity; the server is free to ignore it and we won't have
+	// negotiated compression as a result.
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "GET %s HTTP/1.1\r\n", u.RequestURI())
 	fmt.Fprintf(&sb, "Host: %s\r\n", u.Host)
-	fmt.Fprintf(&sb, "User-Agent: %s\r\n", ua)
 	sb.WriteString("Connection: Upgrade\r\n")
+	sb.WriteString("Pragma: no-cache\r\n")
+	sb.WriteString("Cache-Control: no-cache\r\n")
+	fmt.Fprintf(&sb, "User-Agent: %s\r\n", ua)
 	sb.WriteString("Upgrade: websocket\r\n")
+	fmt.Fprintf(&sb, "Origin: https://%s\r\n", u.Hostname())
 	sb.WriteString("Sec-WebSocket-Version: 13\r\n")
+	sb.WriteString("Accept-Encoding: gzip, deflate, br\r\n")
+	sb.WriteString("Accept-Language: en-US,en;q=0.9\r\n")
 	fmt.Fprintf(&sb, "Sec-WebSocket-Key: %s\r\n", key)
+	sb.WriteString("Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n")
 	for k, v := range opts.Headers {
 		fmt.Fprintf(&sb, "%s: %s\r\n", k, v)
 	}
@@ -398,8 +452,10 @@ func (p *prefixedRWC) Read(b []byte) (int, error) {
 	return p.under.Read(b)
 }
 
-func (p *prefixedRWC) Write(b []byte) (int, error) { return p.under.Write(b) }
-func (p *prefixedRWC) Close() error                { return p.under.Close() }
+func (p *prefixedRWC) Write(b []byte) (int, error)        { return p.under.Write(b) }
+func (p *prefixedRWC) Close() error                       { return p.under.Close() }
+func (p *prefixedRWC) SetReadDeadline(t time.Time) error  { return p.under.SetReadDeadline(t) }
+func (p *prefixedRWC) SetWriteDeadline(t time.Time) error { return p.under.SetWriteDeadline(t) }
 
 func headerContainsToken(h http.Header, name, want string) bool {
 	for _, v := range h.Values(name) {

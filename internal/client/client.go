@@ -117,6 +117,27 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 	}
 	defer conn.Close()
 
+	// Bound the handshake. Without this, a server that accepts the TCP
+	// connection but never sends HELLO_ACK would block Run forever.
+	const handshakeTimeout = 30 * time.Second
+	deadline := time.Now().Add(handshakeTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	_ = conn.SetReadDeadline(deadline)
+	_ = conn.SetWriteDeadline(deadline)
+
+	// Honor ctx cancellation by closing the conn, which unblocks any I/O.
+	handshakeDone := make(chan struct{})
+	defer close(handshakeDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-handshakeDone:
+		}
+	}()
+
 	hello := frame.Frame{
 		Type:    frame.TypeHello,
 		Payload: encodeHelloPayload(cfg.SessionID, cfg.LocalTarget, cfg.TTL),
