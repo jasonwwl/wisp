@@ -8,13 +8,18 @@ import (
 	"sync"
 )
 
-// PortAllocator hands out free TCP ports from an inclusive range.
+// PortAllocator hands out free TCP ports. In "fixed-range" mode it
+// picks the lowest free port from an inclusive range; in "ephemeral"
+// mode (spec "0" or "auto") it always returns 0 and lets the OS pick
+// a free port at bind time.
+//
 // It is the in-memory authority for what's currently leased — it does
 // not itself bind any sockets. The caller is responsible for actually
 // listening on the port returned by Acquire, and for calling Release
 // once the listener is torn down.
 type PortAllocator struct {
-	lo, hi int
+	lo, hi    int
+	ephemeral bool
 
 	mu   sync.Mutex
 	used map[int]struct{}
@@ -23,13 +28,22 @@ type PortAllocator struct {
 // ErrExhausted is returned by Acquire when no port in the range is free.
 var ErrExhausted = errors.New("portalloc: range exhausted")
 
-// NewPortAllocator parses a range spec ("lo-hi" inclusive) and returns
-// an allocator. Both endpoints are required; "0-0" is rejected — use
-// a real range like "22000-22099".
+// NewPortAllocator parses a range spec and returns an allocator.
+//
+// Accepted forms:
+//   - "lo-hi"          fixed inclusive range, e.g. "22000-22099"
+//   - "0" or "auto"    ephemeral mode: every Acquire returns 0, and
+//     the caller is expected to bind to ":0" so the
+//     kernel picks a free port. Useful for tests and
+//     for deployments that don't care about port
+//     determinism.
 func NewPortAllocator(spec string) (*PortAllocator, error) {
+	if spec == "0" || spec == "auto" {
+		return &PortAllocator{ephemeral: true, used: make(map[int]struct{})}, nil
+	}
 	dash := strings.IndexByte(spec, '-')
 	if dash < 1 || dash == len(spec)-1 {
-		return nil, fmt.Errorf("portalloc: bad spec %q (want lo-hi)", spec)
+		return nil, fmt.Errorf("portalloc: bad spec %q (want lo-hi, \"0\", or \"auto\")", spec)
 	}
 	lo, err := strconv.Atoi(strings.TrimSpace(spec[:dash]))
 	if err != nil {
@@ -48,8 +62,16 @@ func NewPortAllocator(spec string) (*PortAllocator, error) {
 	return &PortAllocator{lo: lo, hi: hi, used: make(map[int]struct{})}, nil
 }
 
-// Acquire returns the lowest free port in the range, marking it as used.
+// Ephemeral reports whether this allocator delegates port choice to
+// the OS (spec was "0" or "auto").
+func (p *PortAllocator) Ephemeral() bool { return p.ephemeral }
+
+// Acquire returns the lowest free port in the range, marking it as
+// used. In ephemeral mode it returns 0 unconditionally.
 func (p *PortAllocator) Acquire() (int, error) {
+	if p.ephemeral {
+		return 0, nil
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for port := p.lo; port <= p.hi; port++ {
@@ -62,8 +84,11 @@ func (p *PortAllocator) Acquire() (int, error) {
 }
 
 // Release marks a previously-acquired port as free. Releasing a port
-// that was never acquired is a no-op.
+// that was never acquired (or in ephemeral mode) is a no-op.
 func (p *PortAllocator) Release(port int) {
+	if p.ephemeral {
+		return
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	delete(p.used, port)

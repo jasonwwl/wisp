@@ -139,6 +139,76 @@ func TestForward_MultipleStreams(t *testing.T) {
 	wg.Wait()
 }
 
+// TestForward_TTLExpiry ensures the server tears the tunnel down once
+// the granted TTL elapses: the public port stops accepting and the
+// client's Forward returns.
+func TestForward_TTLExpiry(t *testing.T) {
+	echo := startEchoServer(t)
+	defer echo.Close()
+
+	srv, host, ep, token := mustStartServer(t)
+	defer srv.Stop()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Use a tiny TTL. The server clamps requested_ttl=0 up to 1h, so we
+	// pass an explicit small value. The smallest non-zero uint32 is 1s.
+	sess, err := client.Dial(ctx, client.Config{
+		Server:             host,
+		Endpoint:           ep,
+		Token:              token,
+		LocalTarget:        echo.Addr().String(),
+		TTL:                1 * time.Second,
+		InsecureSkipVerify: true,
+		Logger:             quietLogger(),
+	})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	if sess.GrantedTTL > 5*time.Second {
+		t.Fatalf("expected small granted ttl, got %s", sess.GrantedTTL)
+	}
+
+	forwardDone := make(chan error, 1)
+	go func() { forwardDone <- sess.Forward(ctx) }()
+
+	publicAddr := hostnameOf(host) + ":" + strconv.Itoa(int(sess.PublicPort))
+
+	// Before TTL: dial works.
+	c, err := dialWithRetry("tcp", publicAddr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("pre-ttl dial: %v", err)
+	}
+	c.Close()
+
+	// Wait for TTL to fire + drain (1s ttl + 100ms drain + 500ms slack).
+	time.Sleep(2 * time.Second)
+
+	// After TTL: dial should fail (listener was closed) OR succeed and
+	// then immediately read EOF. Either is a valid teardown signal.
+	c2, err := net.DialTimeout("tcp", publicAddr, 500*time.Millisecond)
+	if err == nil {
+		// If we got a connection, it must close immediately.
+		_ = c2.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		buf := make([]byte, 1)
+		if _, rerr := c2.Read(buf); rerr == nil {
+			t.Error("connection accepted bytes after TTL expiry")
+		}
+		c2.Close()
+	}
+
+	// Forward should return cleanly.
+	select {
+	case err := <-forwardDone:
+		if err != nil {
+			t.Errorf("Forward returned: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Error("Forward did not return after TTL expiry")
+	}
+}
+
 // TestDial_BadToken: indistinguishable 404 on the wire side.
 func TestDial_BadToken(t *testing.T) {
 	srv, host, ep, _ := mustStartServer(t)
@@ -227,7 +297,7 @@ func mustStartServer(t *testing.T) (*runningServer, string, string, string) {
 		Listen:            addr,
 		Domain:            "localhost",
 		Token:             token,
-		PortRange:         randomPortRange(),
+		PortRange:         "auto", // kernel-picks public ports; avoids TIME_WAIT cross-test collisions
 		TunnelBindHost:    "127.0.0.1",
 		TLSAutoSelfSigned: true,
 		Logger:            quietLogger(),
@@ -260,18 +330,6 @@ func mustStartServer(t *testing.T) (*runningServer, string, string, string) {
 	rs.Stop()
 	t.Fatal("server did not start accepting in time")
 	return nil, "", "", ""
-}
-
-// randomPortRange picks a 100-port slice in the high range to reduce
-// collision chances during parallel test runs.
-var portRangeCounter int
-
-func randomPortRange() string {
-	// Stagger ranges per call to avoid intra-test-run collisions.
-	portRangeCounter++
-	lo := 50000 + (portRangeCounter*200)%10000
-	hi := lo + 99
-	return strconv.Itoa(lo) + "-" + strconv.Itoa(hi)
 }
 
 func hostnameOf(hostPort string) string {

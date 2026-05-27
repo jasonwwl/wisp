@@ -54,3 +54,25 @@ func TestPortAllocator_ReleaseUnknown(t *testing.T) {
 		t.Error("InUse should be false after Release(150)")
 	}
 }
+
+func TestPortAllocator_Ephemeral(t *testing.T) {
+	for _, spec := range []string{"0", "auto"} {
+		a, err := NewPortAllocator(spec)
+		if err != nil {
+			t.Fatalf("spec %q: %v", spec, err)
+		}
+		if !a.Ephemeral() {
+			t.Errorf("spec %q: Ephemeral() = false, want true", spec)
+		}
+		for i := 0; i < 3; i++ {
+			p, err := a.Acquire()
+			if err != nil {
+				t.Errorf("spec %q Acquire #%d: %v", spec, i, err)
+			}
+			if p != 0 {
+				t.Errorf("spec %q Acquire #%d: got %d, want 0 (OS-picks)", spec, i, p)
+			}
+		}
+		a.Release(0) // no-op, must not panic
+	}
+}

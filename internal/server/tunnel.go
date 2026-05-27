@@ -2,7 +2,6 @@ package server
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -74,23 +73,58 @@ func (s *Server) tunnelHandler(w http.ResponseWriter, r *http.Request) {
 	log = log.With("session", base64Short(hello.SessionID[:]), "target", hello.Target)
 	log.Info("hello received", "requested_ttl", hello.RequestedTTL)
 
-	// 2. Allocate a public port.
-	port, err := s.ports.Acquire()
-	if err != nil {
-		log.Warn("port allocator empty", "err", err)
-		_ = sendAck(wsc, &protocol.HelloAck{Code: protocol.AckPortsExhausted, Message: err.Error()})
-		return
+	// 2-3. Allocate a public port and bind a listener.
+	//
+	// In ephemeral mode the allocator returns 0 and we let the kernel
+	// pick a port at bind time; that path bypasses TIME_WAIT collisions
+	// entirely and is what we use in tests.
+	//
+	// In fixed-range mode the allocator's in-memory map can hand out a
+	// port that's still in TIME_WAIT from a previous tunnel, so we
+	// retry the next few free ports before giving up.
+	var (
+		port     int
+		listener net.Listener
+		bindAddr string
+	)
+	if s.ports.Ephemeral() {
+		port, _ = s.ports.Acquire() // always 0
+		bindAddr = net.JoinHostPort(s.cfg.TunnelBindHost, "0")
+		listener, err = net.Listen("tcp", bindAddr)
+		if err != nil {
+			log.Warn("ephemeral bind failed", "addr", bindAddr, "err", err)
+			_ = sendAck(wsc, &protocol.HelloAck{Code: protocol.AckInternalError, Message: "bind failed"})
+			return
+		}
+	} else {
+		const maxBindTries = 8
+		tried := make([]int, 0, maxBindTries)
+		for i := 0; i < maxBindTries; i++ {
+			port, err = s.ports.Acquire()
+			if err != nil {
+				break // exhausted
+			}
+			bindAddr = net.JoinHostPort(s.cfg.TunnelBindHost, strconv.Itoa(port))
+			listener, err = net.Listen("tcp", bindAddr)
+			if err == nil {
+				break
+			}
+			log.Warn("bind retry", "addr", bindAddr, "err", err)
+			tried = append(tried, port)
+		}
+		for _, p := range tried {
+			s.ports.Release(p)
+		}
+		if listener == nil {
+			log.Warn("could not bind any port in range", "tried", len(tried)+1, "last_err", err)
+			_ = sendAck(wsc, &protocol.HelloAck{Code: protocol.AckInternalError, Message: "no free port could be bound"})
+			if port > 0 {
+				s.ports.Release(port)
+			}
+			return
+		}
 	}
 	defer s.ports.Release(port)
-
-	// 3. Bind a listener.
-	bindAddr := net.JoinHostPort(s.cfg.TunnelBindHost, strconv.Itoa(port))
-	listener, err := net.Listen("tcp", bindAddr)
-	if err != nil {
-		log.Warn("bind failed", "addr", bindAddr, "err", err)
-		_ = sendAck(wsc, &protocol.HelloAck{Code: protocol.AckInternalError, Message: "bind failed"})
-		return
-	}
 	defer listener.Close()
 
 	// Re-derive the bound port from the listener (helps in the case where
@@ -135,29 +169,48 @@ func (s *Server) tunnelHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Info("ack sent", "granted_ttl", grantedTTL)
 
-	// 6. Accept loop. Each incoming TCP connection opens a yamux stream
-	//    and we shuttle bytes both ways.
-	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
-
-	// Close the listener when the yamux session dies (so Accept returns).
+	// 6. Run the accept loop in a goroutine; the main goroutine waits
+	//    for whichever lifecycle signal fires first.
+	acceptDone := make(chan struct{})
 	go func() {
-		<-ysess.CloseChan()
-		_ = listener.Close()
-	}()
-
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			if errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
-				log.Info("accept loop stopping")
+		defer close(acceptDone)
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				if errors.Is(err, net.ErrClosed) || r.Context().Err() != nil {
+					return
+				}
+				log.Warn("accept", "err", err)
 				return
 			}
-			log.Warn("accept", "err", err)
-			return
+			go forwardServerSide(ysess, conn, log)
 		}
-		go forwardServerSide(ysess, conn, log)
+	}()
+
+	// 7. Lifecycle: shut the tunnel down on TTL expiry, on yamux death,
+	//    or on server-wide shutdown.
+	ttlTimer := time.NewTimer(time.Duration(grantedTTL) * time.Second)
+	defer ttlTimer.Stop()
+
+	select {
+	case <-ttlTimer.C:
+		log.Info("ttl expired")
+		// Tell the client politely; ignore errors (it may already be gone).
+		_ = sendBye(wsc, protocol.ByeTTLExpired, "ttl reached")
+		// Brief drain window so the BYE has a chance to leave the kernel
+		// buffer before we slam the underlying conn shut.
+		time.Sleep(100 * time.Millisecond)
+	case <-ysess.CloseChan():
+		log.Info("yamux session closed")
+	case <-r.Context().Done():
+		log.Info("server shutting down, closing tunnel")
+		_ = sendBye(wsc, protocol.ByeServerShutdown, "server shutdown")
 	}
+
+	_ = listener.Close()
+	_ = ysess.Close()
+	<-acceptDone
+	log.Info("tunnel torn down")
 }
 
 func forwardServerSide(ysess *yamux.Session, in net.Conn, log *slog.Logger) {
@@ -208,6 +261,19 @@ func sendAck(c *wsraw.Conn, ack *protocol.HelloAck) error {
 		return err
 	}
 	f := frame.Frame{Type: frame.TypeHelloAck, Payload: body}
+	var buf bytes.Buffer
+	if err := f.Encode(&buf, 64); err != nil {
+		return err
+	}
+	return c.WriteMessage(buf.Bytes())
+}
+
+func sendBye(c *wsraw.Conn, code protocol.ByeCode, msg string) error {
+	body, err := (&protocol.Bye{Code: code, Message: msg}).Encode()
+	if err != nil {
+		return err
+	}
+	f := frame.Frame{Type: frame.TypeBye, Payload: body}
 	var buf bytes.Buffer
 	if err := f.Encode(&buf, 64); err != nil {
 		return err
