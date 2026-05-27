@@ -36,8 +36,7 @@ func (s *Server) tunnelHandler(w http.ResponseWriter, r *http.Request) {
 	log := s.log.With("remote", r.RemoteAddr)
 
 	if !s.checkAuth(r) {
-		w.Header().Set("Server", "nginx/1.24.0")
-		w.WriteHeader(http.StatusNotFound)
+		s.write404(w)
 		log.Warn("tunnel auth failed")
 		return
 	}
@@ -46,10 +45,7 @@ func (s *Server) tunnelHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Warn("ws upgrade failed", "err", err, "hijacked", hijacked)
 		if !hijacked {
-			w.Header().Set("Server", "nginx/1.24.0")
-			w.Header().Set("Content-Type", "text/html; charset=UTF-8")
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(builtinNotFound))
+			s.write404(w)
 		}
 		return
 	}

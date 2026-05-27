@@ -87,4 +87,84 @@ func TestTunnel_BadTokenLooksLike404(t *testing.T) {
 	if got := w.Header().Get("Server"); got != "nginx/1.24.0" {
 		t.Errorf("Server header: got %q, want %q", got, "nginx/1.24.0")
 	}
+	if !strings.Contains(w.Body.String(), "404 Not Found") {
+		t.Errorf("body should mimic the decoy 404, got %q", w.Body.String())
+	}
+}
+
+// TestTunnel_404BytesMatchDecoy is the load-bearing fingerprint
+// regression: every 404 path on this server — decoy fall-through,
+// tunnel endpoint without a token, tunnel endpoint with WS headers
+// but no token — must produce byte-for-byte identical responses.
+// A passive NGFW that observes one signature and probes the other
+// must not be able to distinguish them.
+func TestTunnel_404BytesMatchDecoy(t *testing.T) {
+	srv, err := New(Config{
+		Domain:            "localhost",
+		Token:             "the-real-token",
+		Endpoint:          "abcdefghij0123456789ABCDEFGHIJ0123456789xyz",
+		TLSAutoSelfSigned: true,
+		Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// 1. decoy 404: a random URL handed to decoyHandler.
+	decoyReq := httptest.NewRequest("GET", "/random-not-found", nil)
+	decoyW := httptest.NewRecorder()
+	srv.decoyHandler(decoyW, decoyReq)
+
+	// 2. tunnel auth-fail: valid endpoint path, missing/wrong token.
+	authReq := httptest.NewRequest("GET", "/"+srv.Endpoint()+"/ws", nil)
+	authReq.Header.Set("Authorization", "Bearer wrong-token")
+	authW := newRecorder()
+	srv.tunnelHandler(authW, authReq)
+
+	// 3. tunnel WS-upgrade-fail: valid endpoint + valid token but the
+	//    response writer doesn't implement http.Hijacker (i.e. an
+	//    HTTP/2 path or any other non-hijackable transport).
+	hijackReq := httptest.NewRequest("GET", "/"+srv.Endpoint()+"/ws", nil)
+	hijackReq.Header.Set("Authorization", "Bearer the-real-token")
+	hijackReq.Header.Set("Connection", "Upgrade")
+	hijackReq.Header.Set("Upgrade", "websocket")
+	hijackReq.Header.Set("Sec-WebSocket-Version", "13")
+	hijackReq.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	hijackW := newRecorder()
+	srv.tunnelHandler(hijackW, hijackReq)
+
+	cases := []struct {
+		name string
+		w    interface {
+			Result() *http.Response
+		}
+		code int
+		body string
+	}{
+		{"decoy 404", decoyW, decoyW.Code, decoyW.Body.String()},
+		{"tunnel auth-fail", authW, authW.Code, authW.Body.String()},
+		{"tunnel hijack-fail", hijackW, hijackW.Code, hijackW.Body.String()},
+	}
+
+	for _, c := range cases {
+		t.Logf("%-22s code=%d  body_len=%d  body=%q", c.name, c.code, len(c.body), c.body)
+	}
+
+	want := cases[0]
+	for _, c := range cases[1:] {
+		if c.code != want.code {
+			t.Errorf("%s: status %d != decoy %d", c.name, c.code, want.code)
+		}
+		if c.body != want.body {
+			t.Errorf("%s: body differs from decoy\n  decoy: %q\n  got:   %q", c.name, want.body, c.body)
+		}
+		// Header equality on the bits an NGFW reads.
+		dh := decoyW.Header()
+		ch := c.w.Result().Header
+		for _, h := range []string{"Server", "Content-Type"} {
+			if dh.Get(h) != ch.Get(h) {
+				t.Errorf("%s: header %s differs: decoy=%q got=%q", c.name, h, dh.Get(h), ch.Get(h))
+			}
+		}
+	}
 }
