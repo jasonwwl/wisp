@@ -29,22 +29,31 @@ func resolveTLS(cfg Config) (*tls.Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("load cert/key: %w", err)
 		}
-		return &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-		}, nil
+		return baseTLSConfig(cert), nil
 	}
 	if cfg.TLSAutoSelfSigned {
 		cert, err := generateSelfSignedCert(cfg.Domain)
 		if err != nil {
 			return nil, fmt.Errorf("self-sign: %w", err)
 		}
-		return &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-		}, nil
+		return baseTLSConfig(cert), nil
 	}
 	return nil, errors.New("server: no TLS configured (set TLSCert/TLSKey, TLSConfig, or TLSAutoSelfSigned)")
+}
+
+// baseTLSConfig returns the shared *tls.Config we use for every wisp
+// listener. We pin ALPN to "http/1.1" so the tunnel endpoint (which
+// requires HTTP/1.1 Upgrade semantics) is never negotiated as HTTP/2 —
+// real WebSocket-over-HTTP/2 (RFC 8441) would need a separate
+// implementation, and selective per-path ALPN is not a thing in TLS.
+// The decoy site is content with HTTP/1.1; small self-hosted sites
+// commonly run that way.
+func baseTLSConfig(cert tls.Certificate) *tls.Config {
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+		NextProtos:   []string{"http/1.1"},
+	}
 }
 
 // generateSelfSignedCert returns an ephemeral self-signed certificate.

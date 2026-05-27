@@ -16,6 +16,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net"
 	"net/http"
@@ -23,6 +24,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	utls "github.com/refraction-networking/utls"
 )
 
 const magicGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -333,6 +336,11 @@ type DialOptions struct {
 	Headers   map[string]string // extra request headers (Authorization, etc.)
 	TLSConfig *tls.Config       // SNI defaults to URL host if ServerName is empty
 	UserAgent string            // override the default User-Agent
+	// HelloID, when non-zero, forces a specific uTLS ClientHello profile
+	// (e.g. utls.HelloChrome_Auto, utls.HelloFirefox_120). The default
+	// picks one deterministically from the server hostname so a given
+	// client looks like the same browser across reconnects.
+	HelloID utls.ClientHelloID
 }
 
 // Dial connects to a WebSocket endpoint over TLS and returns a client-side
@@ -360,13 +368,11 @@ func Dial(opts DialOptions) (*Conn, error) {
 	// Browsers performing a WebSocket upgrade only negotiate http/1.1 at
 	// ALPN time: they know they will need Connection: Upgrade semantics,
 	// which HTTP/2 does not provide (RFC 8441 is rarely supported).
-	// Matching this avoids the "empty ALPN" fingerprint that Go's default
-	// TLS client would otherwise expose.
 	if tlsCfg.NextProtos == nil {
 		tlsCfg.NextProtos = []string{"http/1.1"}
 	}
 
-	tcpConn, err := tls.Dial("tcp", host, tlsCfg)
+	tcpConn, err := dialUTLS(host, tlsCfg, opts.HelloID)
 	if err != nil {
 		return nil, fmt.Errorf("tls dial %s: %w", host, err)
 	}
@@ -456,6 +462,54 @@ func (p *prefixedRWC) Write(b []byte) (int, error)        { return p.under.Write
 func (p *prefixedRWC) Close() error                       { return p.under.Close() }
 func (p *prefixedRWC) SetReadDeadline(t time.Time) error  { return p.under.SetReadDeadline(t) }
 func (p *prefixedRWC) SetWriteDeadline(t time.Time) error { return p.under.SetWriteDeadline(t) }
+
+// dialUTLS opens a TCP connection to host and performs a uTLS handshake
+// using a browser-mimicking ClientHello profile. Returns a net.Conn
+// suitable for plain Read/Write/Close/SetDeadline calls.
+func dialUTLS(host string, cfg *tls.Config, override utls.ClientHelloID) (net.Conn, error) {
+	rawConn, err := net.DialTimeout("tcp", host, 15*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("tcp dial: %w", err)
+	}
+	uCfg := &utls.Config{
+		ServerName:         cfg.ServerName,
+		InsecureSkipVerify: cfg.InsecureSkipVerify, //nolint:gosec // dev opt-in mirrored from caller
+		NextProtos:         cfg.NextProtos,
+		MinVersion:         cfg.MinVersion,
+		MaxVersion:         cfg.MaxVersion,
+		RootCAs:            cfg.RootCAs,
+	}
+	hello := override
+	if hello == (utls.ClientHelloID{}) {
+		hello = pickHelloID(cfg.ServerName)
+	}
+	uConn := utls.UClient(rawConn, uCfg, hello)
+	if err := uConn.Handshake(); err != nil {
+		_ = rawConn.Close()
+		return nil, fmt.Errorf("utls handshake: %w", err)
+	}
+	return uConn, nil
+}
+
+// pickHelloID returns a deterministic ClientHello profile based on the
+// hostname. This ensures repeated connections from the same wisp client
+// to the same wisp server look like the same browser — a single client
+// suddenly "fingerprint-hopping" between Chrome and Firefox would itself
+// be a fingerprint.
+func pickHelloID(host string) utls.ClientHelloID {
+	profiles := []utls.ClientHelloID{
+		utls.HelloChrome_Auto,
+		utls.HelloFirefox_Auto,
+		utls.HelloSafari_Auto,
+		utls.HelloEdge_Auto,
+	}
+	if host == "" {
+		return profiles[0]
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(host))
+	return profiles[h.Sum64()%uint64(len(profiles))]
+}
 
 func headerContainsToken(h http.Header, name, want string) bool {
 	for _, v := range h.Values(name) {
