@@ -141,10 +141,8 @@ in wisp.Frame envelopes with their own `Type`.
 
 ## What's deferred and why
 
-These are intentionally not in v0.1:
+These are intentionally not in v0.1, and not all are done yet in v0.2:
 
-- **Session resume window** (5 min). The protocol already carries a
-  session_id; the server just doesn't keep state across WS drop yet.
 - **HELLO nonce verification.** The server reads it but doesn't yet
   bind subsequent frames to it.
 - **`--shape burst` / `--shape chaff`.** Padding is on by default;

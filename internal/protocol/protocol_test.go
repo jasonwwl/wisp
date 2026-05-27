@@ -18,6 +18,7 @@ func TestHello_RoundTrip(t *testing.T) {
 		Nonce:        nonce,
 		RequestedTTL: 3600,
 		Target:       "127.0.0.1:22",
+		Mode:         HelloModeResume,
 	}
 	b, err := in.Encode()
 	if err != nil {
@@ -39,6 +40,9 @@ func TestHello_RoundTrip(t *testing.T) {
 	if out.Target != in.Target {
 		t.Errorf("target: got %q, want %q", out.Target, in.Target)
 	}
+	if out.Mode != in.Mode {
+		t.Errorf("mode: got %d, want %d", out.Mode, in.Mode)
+	}
 }
 
 func TestHello_EmptyTarget(t *testing.T) {
@@ -47,8 +51,8 @@ func TestHello_EmptyTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(b) != 54 {
-		t.Errorf("len: got %d, want 54", len(b))
+	if len(b) != 55 {
+		t.Errorf("len: got %d, want 55", len(b))
 	}
 	out, err := DecodeHello(b)
 	if err != nil {
@@ -56,6 +60,36 @@ func TestHello_EmptyTarget(t *testing.T) {
 	}
 	if out.Target != "" {
 		t.Errorf("target: got %q, want empty", out.Target)
+	}
+	if out.Mode != HelloModeFresh {
+		t.Errorf("mode: got %d, want fresh (0)", out.Mode)
+	}
+}
+
+// TestHello_V01WireDecodesAsFresh covers v0.1 ↔ v0.2 forward compatibility:
+// a peer that emits a 54+tl-byte HELLO (no trailing mode byte) must decode
+// as HelloModeFresh, with no protocol error.
+func TestHello_V01WireDecodesAsFresh(t *testing.T) {
+	const target = "127.0.0.1:22"
+	v01 := make([]byte, 54+len(target))
+	// Skip session_id, nonce (zero is fine for the test).
+	// RequestedTTL.
+	v01[48], v01[49], v01[50], v01[51] = 0, 0, 0x0E, 0x10 // 3600
+	v01[52], v01[53] = 0, byte(len(target))               // target_len
+	copy(v01[54:], target)
+
+	out, err := DecodeHello(v01)
+	if err != nil {
+		t.Fatalf("decode v0.1 wire: %v", err)
+	}
+	if out.Target != target {
+		t.Errorf("target: got %q, want %q", out.Target, target)
+	}
+	if out.RequestedTTL != 3600 {
+		t.Errorf("ttl: got %d, want 3600", out.RequestedTTL)
+	}
+	if out.Mode != HelloModeFresh {
+		t.Errorf("mode: got %d, want fresh", out.Mode)
 	}
 }
 
@@ -70,7 +104,7 @@ func TestHello_RejectsOversizedTarget(t *testing.T) {
 func TestHello_RejectsTruncated(t *testing.T) {
 	in := &Hello{Target: "127.0.0.1:22"}
 	b, _ := in.Encode()
-	for _, cut := range []int{0, 1, 53, len(b) - 1} {
+	for _, cut := range []int{0, 1, 53, 54 + len(in.Target) - 1} {
 		if _, err := DecodeHello(b[:cut]); err == nil {
 			t.Errorf("cut=%d: expected error, got nil", cut)
 		}

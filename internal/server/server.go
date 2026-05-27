@@ -39,6 +39,11 @@ type Config struct {
 	// for the forwarding milestone.)
 	PortRange string
 
+	// ResumeWindow is how long a disconnected session may be re-attached
+	// to via mode=resume. Zero defaults to DefaultResumeWindow (5 min).
+	// Tests use shorter values to keep total runtime down.
+	ResumeWindow time.Duration
+
 	// DecoyDir is an optional path to a directory of static files served
 	// as the decoy site. If empty, a built-in "Welcome to nginx" page is
 	// served.
@@ -91,12 +96,13 @@ type Config struct {
 
 // Server is a configured but not-yet-running wisp server.
 type Server struct {
-	cfg   Config
-	hsrv  *http.Server
-	log   *slog.Logger
-	mux   *http.ServeMux
-	ports *PortAllocator
-	acme  *acmeRuntime
+	cfg      Config
+	hsrv     *http.Server
+	log      *slog.Logger
+	mux      *http.ServeMux
+	ports    *PortAllocator
+	sessions *sessionRegistry
+	acme     *acmeRuntime
 }
 
 // New validates cfg and returns a ready-to-Run Server.
@@ -149,7 +155,16 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 
-	s := &Server{cfg: cfg, log: cfg.Logger, mux: http.NewServeMux(), ports: alloc, acme: acme}
+	sessions := newSessionRegistry(alloc, cfg.ResumeWindow, cfg.Logger)
+
+	s := &Server{
+		cfg:      cfg,
+		log:      cfg.Logger,
+		mux:      http.NewServeMux(),
+		ports:    alloc,
+		sessions: sessions,
+		acme:     acme,
+	}
 	s.mux.HandleFunc("/", s.decoyHandler)
 	s.mux.HandleFunc("/"+cfg.Endpoint+"/ws", s.tunnelHandler)
 
@@ -204,12 +219,15 @@ func (s *Server) Run(ctx context.Context) error {
 		if s.acme != nil {
 			_ = s.acme.Shutdown(shutdownCtx)
 		}
+		s.sessions.Close()
 		<-errCh
 		return nil
 	case err := <-errCh:
 		if errors.Is(err, http.ErrServerClosed) {
+			s.sessions.Close()
 			return nil
 		}
+		s.sessions.Close()
 		return err
 	}
 }

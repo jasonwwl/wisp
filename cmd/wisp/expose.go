@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jasonwwl/wisp/internal/client"
+	"github.com/jasonwwl/wisp/internal/protocol"
 )
 
 type exposeOpts struct {
@@ -21,6 +22,7 @@ type exposeOpts struct {
 	to       string
 	ttl      time.Duration
 	resume   string
+	noResume bool
 	detach   bool
 	insecure bool
 	verbose  bool
@@ -35,7 +37,8 @@ func exposeFlags(opts *exposeOpts) *flag.FlagSet {
 	fs.StringVar(&opts.token, "t", os.Getenv("WISP_TOKEN"), "alias for --token")
 	fs.StringVar(&opts.to, "to", "127.0.0.1:22", "local TCP target to expose")
 	fs.DurationVar(&opts.ttl, "ttl", time.Hour, "tunnel time-to-live")
-	fs.StringVar(&opts.resume, "resume", "", "resume a previous session by id (reserved)")
+	fs.StringVar(&opts.resume, "resume", "", "attach to a previous session id (must still be inside the server's resume window)")
+	fs.BoolVar(&opts.noResume, "no-resume", false, "disable auto-resume on transient disconnects (v0.1 behaviour)")
 	fs.BoolVar(&opts.detach, "detach", false, "re-exec as a background daemon; closing the terminal does not stop the tunnel")
 	fs.BoolVar(&opts.insecure, "insecure-dev", false, "skip TLS verification (development only)")
 	fs.BoolVar(&opts.verbose, "verbose", false, "enable debug logging")
@@ -77,6 +80,11 @@ func runExpose(args []string, stdout, stderr io.Writer) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	initialMode := protocol.HelloModeFresh
+	if opts.resume != "" {
+		initialMode = protocol.HelloModeResume
+	}
+
 	sess, err := client.Dial(ctx, client.Config{
 		Server:             opts.server,
 		Endpoint:           opts.endpoint,
@@ -84,6 +92,8 @@ func runExpose(args []string, stdout, stderr io.Writer) error {
 		LocalTarget:        opts.to,
 		TTL:                opts.ttl,
 		SessionID:          opts.resume,
+		InitialMode:        initialMode,
+		AutoResume:         !opts.noResume,
 		InsecureSkipVerify: opts.insecure,
 		Logger:             logger,
 	})
@@ -121,7 +131,7 @@ func runExpose(args []string, stdout, stderr io.Writer) error {
 			"ttl", sess.GrantedTTL,
 		)
 	}
-	return sess.Forward(ctx)
+	return sess.Run(ctx)
 }
 
 func hostOnly(hostPort string) string {
