@@ -147,7 +147,11 @@ These are intentionally not in v0.1, and not all are done yet in v0.2:
   bind subsequent frames to it.
 - **Windows `--detach`.** Re-exec with `DETACHED_PROCESS` works but
   needs `golang.org/x/sys/windows`; not yet worth adding.
-- **HTTP/2 RFC 8441 transport.** See pitfall above.
+- **HTTP/2 RFC 8441 transport.** See pitfall above. **Top priority for
+  v0.3** — NGFW probe panel against `wisp.shiyuehehu.com` confirmed
+  ALPN h1-only is the load-bearing residual fingerprint after every
+  other shape knob is on. Implementation sketch in
+  [`docs/design.md`](docs/design.md) §15.1.
 
 ## Pointers
 

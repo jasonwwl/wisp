@@ -486,6 +486,53 @@ shell" URL in passive scans of the domain.
 
 ## 15. Open questions / future work
 
+### 15.1 HTTP/2 RFC 8441 WebSocket transport (top priority for v0.3)
+
+In a v0.2 NGFW dry-run against `wisp.shiyuehehu.com:8443` (active
+probes + JA3/JA4 + nmap service fingerprinting + 4×15s pcap captures
+in `noshape` / `burst` / `chaff` modes), the only protocol-level signal
+that survived was **ALPN negotiating `http/1.1` only** while the
+domain otherwise looked like an ordinary 2025+ HTTPS site. Modern
+self-hosted services overwhelmingly default to `h2`. A single
+domain that only ever speaks `h1` is the load-bearing residual
+fingerprint after every other knob is turned on.
+
+Sketch of what landing this requires:
+
+1. **Server-side ALPN policy.** Today the server forces ALPN to
+   `http/1.1` (see CLAUDE.md "Things that have bitten us"). The
+   listener's `tls.Config.NextProtos` should accept both `h2` and
+   `http/1.1`, and `http.Server` already serves both natively.
+2. **Tunnel endpoint over h2.** `/<endpoint>/ws` must accept
+   extended CONNECT requests as defined in RFC 8441
+   (`:method = CONNECT`, `:protocol = websocket`). The h1
+   `Upgrade: websocket` path stays as fallback for intermediaries
+   that strip h2.
+3. **Client uTLS + h2.** The current `internal/wsraw` package is
+   hand-rolled RFC 6455 over a hijacked HTTP/1.1 connection. h2
+   needs a different transport: the client uses `uTLS` for the
+   `ClientHello` then must speak h2 framing on top of the resulting
+   TLS connection. The realistic path is `x/net/http2` driving a
+   single stream after the uTLS handshake completes, with the
+   wsraw read/write helpers re-implemented against the h2 stream's
+   `io.ReadWriter`.
+4. **Pluggable transport seam.** A `wsraw.Transport` interface with
+   two implementations (`h1Upgrade`, `h2ExtendedConnect`) is the
+   minimum-disruption refactor. The frame / yamux / shape / session
+   layers above don't change.
+5. **Validation.** Re-run the NGFW probe panel; ALPN should
+   negotiate `h2` against a Chrome-mimicking client and the JA3/JA4
+   prefix should shift to `t13d-...-h2` (with #ciphers/#exts
+   matching modern Chrome). The decoy site continues to serve h1+h2
+   indistinguishably.
+
+Risk: this is the largest single piece of unfinished work in the
+v0.x line. wsraw is the protocol's load-bearing module; rewriting
+it past h2 is the only change in v0.x that needs a full e2e re-test
+matrix rather than just unit tests.
+
+### 15.2 Other longer-term ideas
+
 - **Domain fronting.** Not in v1. Useful where the adversary cannot
   block the front-end CDN. Cloudflare deprecated it; Fastly still
   works in some forms.
@@ -494,6 +541,6 @@ shell" URL in passive scans of the domain.
 - **Per-tunnel auth.** Currently a single shared token serves the
   whole server. A short-lived per-tunnel token, signed by the server,
   could replace this and would scale to multi-user.
-- **Pluggable transports.** Carve the WebSocket-over-TLS step into an
-  interface so that gRPC, HTTP/3, or a raw TLS transport can be
-  swapped in without touching the framing or yamux layers.
+- **Pluggable transports.** §15.1 above is the first concrete
+  instance: a `wsraw.Transport` interface lets gRPC / HTTP/3 / raw
+  TLS get swapped in later without touching framing or yamux.
