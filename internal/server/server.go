@@ -44,6 +44,13 @@ type Config struct {
 	// served.
 	DecoyDir string
 
+	// TunnelBindHost is the host address to bind each tunnel listener on
+	// (the ports that external SSH/HTTP/etc. clients connect to). Empty
+	// defaults to "0.0.0.0". Use "127.0.0.1" for local-only testing or
+	// when the server itself is behind a reverse-proxy that should be
+	// the only ingress to tunnel ports.
+	TunnelBindHost string
+
 	// TLSConfig is used as-is for the listener. If nil, the caller is
 	// expected to set TLSCert/TLSKey or use TLSAutoSelfSigned for dev.
 	TLSConfig *tls.Config
@@ -64,10 +71,11 @@ type Config struct {
 
 // Server is a configured but not-yet-running wisp server.
 type Server struct {
-	cfg  Config
-	hsrv *http.Server
-	log  *slog.Logger
-	mux  *http.ServeMux
+	cfg   Config
+	hsrv  *http.Server
+	log   *slog.Logger
+	mux   *http.ServeMux
+	ports *PortAllocator
 }
 
 // New validates cfg and returns a ready-to-Run Server.
@@ -83,6 +91,9 @@ func New(cfg Config) (*Server, error) {
 	}
 	if cfg.PortRange == "" {
 		cfg.PortRange = "22000-22099"
+	}
+	if cfg.TunnelBindHost == "" {
+		cfg.TunnelBindHost = "0.0.0.0"
 	}
 	if cfg.Endpoint == "" {
 		ep, err := generateEndpoint()
@@ -102,7 +113,12 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 
-	s := &Server{cfg: cfg, log: cfg.Logger, mux: http.NewServeMux()}
+	alloc, err := NewPortAllocator(cfg.PortRange)
+	if err != nil {
+		return nil, err
+	}
+
+	s := &Server{cfg: cfg, log: cfg.Logger, mux: http.NewServeMux(), ports: alloc}
 	s.mux.HandleFunc("/", s.decoyHandler)
 	s.mux.HandleFunc("/"+cfg.Endpoint+"/ws", s.tunnelHandler)
 

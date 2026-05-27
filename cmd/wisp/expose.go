@@ -64,7 +64,7 @@ func runExpose(args []string, stdout, stderr io.Writer) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	res, err := client.Run(ctx, client.Config{
+	sess, err := client.Dial(ctx, client.Config{
 		Server:             opts.server,
 		Endpoint:           opts.endpoint,
 		Token:              opts.token,
@@ -77,10 +77,33 @@ func runExpose(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	defer sess.Close()
 
-	fmt.Fprintf(stdout, "wisp: handshake ok\n")
-	fmt.Fprintf(stdout, "  session: %s\n", res.SessionID)
-	fmt.Fprintf(stdout, "  ack:     %s\n", string(res.AckRaw))
-	fmt.Fprintln(stdout, "(forwarding not yet implemented — see docs/design.md)")
-	return nil
+	fmt.Fprintf(stdout, "wisp: tunnel up\n")
+	fmt.Fprintf(stdout, "  public:  %s:%d\n", hostOnly(opts.server), sess.PublicPort)
+	fmt.Fprintf(stdout, "  session: %s\n", sess.SessionID)
+	fmt.Fprintf(stdout, "  target:  %s\n", opts.to)
+	fmt.Fprintf(stdout, "  ttl:     %s\n", sess.GrantedTTL)
+	fmt.Fprintln(stdout, "Ctrl-C to stop.")
+	return sess.Forward(ctx)
+}
+
+func hostOnly(hostPort string) string {
+	if i := lastColonNonBracket(hostPort); i >= 0 {
+		return hostPort[:i]
+	}
+	return hostPort
+}
+
+func lastColonNonBracket(s string) int {
+	if len(s) > 0 && s[0] == '[' {
+		// IPv6 literal — keep as-is
+		return -1
+	}
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == ':' {
+			return i
+		}
+	}
+	return -1
 }
