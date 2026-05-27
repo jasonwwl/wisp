@@ -16,13 +16,14 @@ import (
 )
 
 type serveOpts struct {
-	listen    string
-	domain    string
-	token     string
-	endpoint  string
-	portRange string
-	decoyDir  string
-	stateDir  string
+	listen         string
+	domain         string
+	token          string
+	endpoint       string
+	portRange      string
+	tunnelBindHost string
+	decoyDir       string
+	stateDir       string
 
 	tlsCert       string
 	tlsKey        string
@@ -42,7 +43,8 @@ func serveFlags(opts *serveOpts) *flag.FlagSet {
 	fs.StringVar(&opts.domain, "domain", "", "public hostname (must match certificate)")
 	fs.StringVar(&opts.token, "token", os.Getenv("WISP_TOKEN"), "shared bearer token (env: WISP_TOKEN)")
 	fs.StringVar(&opts.endpoint, "endpoint", "", "tunnel path segment (random if empty)")
-	fs.StringVar(&opts.portRange, "port-range", "22000-22099", "public TCP port range for tunnels (reserved for forwarding milestone)")
+	fs.StringVar(&opts.portRange, "port-range", "22000-22099", "public TCP port range for tunnels (\"lo-hi\", or \"auto\" for kernel-picked ephemeral ports)")
+	fs.StringVar(&opts.tunnelBindHost, "tunnel-bind-host", "0.0.0.0", "interface to bind tunnel listeners on (e.g. 127.0.0.1 for loopback only)")
 	fs.StringVar(&opts.decoyDir, "decoy-dir", "", "directory of static files to serve as the decoy site")
 	fs.StringVar(&opts.stateDir, "state-dir", defaultStateDir("server"), "directory for persistent state (reserved)")
 	fs.StringVar(&opts.tlsCert, "cert", "", "path to PEM certificate (mutually exclusive with --acme, --tls-self-signed)")
@@ -97,6 +99,7 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 		Token:             opts.token,
 		Endpoint:          opts.endpoint,
 		PortRange:         opts.portRange,
+		TunnelBindHost:    opts.tunnelBindHost,
 		DecoyDir:          opts.decoyDir,
 		TLSCert:           opts.tlsCert,
 		TLSKey:            opts.tlsKey,

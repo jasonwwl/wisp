@@ -29,6 +29,11 @@ See https://github.com/jasonwwl/wisp for documentation.
 `
 
 func main() {
+	// On Unix, ignore SIGPIPE: a long-running tunnel must survive a
+	// downstream pipe closing on stdout (e.g. `wisp expose ... | head`).
+	// Implemented in main_unix.go; no-op on Windows.
+	ignoreStdioSignals()
+
 	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
 		if !errors.Is(err, flag.ErrHelp) {
 			fmt.Fprintln(os.Stderr, "wisp:", err)
