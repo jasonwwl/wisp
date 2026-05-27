@@ -129,11 +129,25 @@ in wisp.Frame envelopes with their own `Type`.
   NAT gateway or SLB: the outer layer needs a DNAT / listener entry
   too. Symptom of missing DNAT is "nc/telnet succeeded" but tcpdump
   on the box shows 0 packets — the outer layer is spoofing SYN-ACK.
-- **WebSocket-over-HTTP/2 is not implemented (RFC 8441).** Both the
-  uTLS client and the http.Server force ALPN to `http/1.1` for the
-  tunnel path. The decoy `/` site is also h1 by consequence; this is
-  fine for low-traffic personal sites. Don't try to enable h2 on the
-  same listener until RFC 8441 is wired in.
+- **Extended CONNECT in x/net/http2 is link-flipped.** Go ships RFC
+  8441 Extended CONNECT disabled by default behind the
+  `GODEBUG=http2xconnect=1` knob (upstream issue #71128). That
+  GODEBUG entry isn't registered with runtime/godebug, so
+  `//go:debug` directives reject it. wisp instead uses
+  `//go:linkname` from `internal/wsraw/wsraw_h2.go` to flip
+  `golang.org/x/net/http2.disableExtendedConnectProtocol` to false
+  at init time, and forces the server to use x/net/http2 (not the
+  bundled stdlib h2) via `http2.ConfigureServer` so the flip
+  actually applies. Remove both once upstream defaults flip.
+- **The `r.Context()` lifetime differs between h1 and h2 tunnels.**
+  On h1 we hijack the conn, so `r.Context()` is effectively dead.
+  On h2 it cancels the moment the client RSTs the stream — which
+  on a clean transport disconnect would evict the session and
+  break `mode=resume`. The tunnel handler therefore selects on a
+  server-scoped `shutdownCtx` (cancelled only when the http.Server
+  is being torn down) for the "BYE then evict" branch, and lets
+  yamux notice transport-level death via `ysess.CloseChan()` for
+  the resume-window case.
 - **`net.Pipe()` is strictly synchronous.** It's used in `mux`
   in-memory tests; payloads bigger than ~4 KiB will deadlock against
   yamux flow control. Real TCP transports buffer past this — the
@@ -141,17 +155,16 @@ in wisp.Frame envelopes with their own `Type`.
 
 ## What's deferred and why
 
-These are intentionally not in v0.1, and not all are done yet in v0.2:
+These are intentionally not in v0.1, and not all are done yet in v0.2/v0.3:
 
 - **HELLO nonce verification.** The server reads it but doesn't yet
   bind subsequent frames to it.
 - **Windows `--detach`.** Re-exec with `DETACHED_PROCESS` works but
   needs `golang.org/x/sys/windows`; not yet worth adding.
-- **HTTP/2 RFC 8441 transport.** See pitfall above. **Top priority for
-  v0.3** — NGFW probe panel against `wisp.shiyuehehu.com` confirmed
-  ALPN h1-only is the load-bearing residual fingerprint after every
-  other shape knob is on. Implementation sketch in
-  [`docs/design.md`](docs/design.md) §15.1.
+- **HTTP/2 RFC 8441 transport.** Landed in v0.3. ALPN now negotiates
+  `h2` by default and the tunnel endpoint accepts Extended CONNECT;
+  the h1 Upgrade path is preserved as a fallback. Rationale and
+  implementation notes in [`docs/design.md`](docs/design.md) §15.1.
 
 ## Pointers
 

@@ -15,6 +15,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"golang.org/x/net/http2"
 )
 
 // Config is the user-facing configuration for a wisp server. Zero values
@@ -103,6 +105,14 @@ type Server struct {
 	ports    *PortAllocator
 	sessions *sessionRegistry
 	acme     *acmeRuntime
+
+	// shutdownCtx is canceled when Run begins to tear the server down.
+	// Tunnel handlers select on it to distinguish a server-wide stop
+	// (BYE + evict) from a single-stream client disconnect (which on
+	// h2 cancels r.Context() but must slide the session into the
+	// resume window, not evict it).
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
 }
 
 // New validates cfg and returns a ready-to-Run Server.
@@ -157,13 +167,16 @@ func New(cfg Config) (*Server, error) {
 
 	sessions := newSessionRegistry(alloc, cfg.ResumeWindow, cfg.Logger)
 
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 	s := &Server{
-		cfg:      cfg,
-		log:      cfg.Logger,
-		mux:      http.NewServeMux(),
-		ports:    alloc,
-		sessions: sessions,
-		acme:     acme,
+		cfg:            cfg,
+		log:            cfg.Logger,
+		mux:            http.NewServeMux(),
+		ports:          alloc,
+		sessions:       sessions,
+		acme:           acme,
+		shutdownCtx:    shutdownCtx,
+		shutdownCancel: shutdownCancel,
 	}
 	s.mux.HandleFunc("/", s.decoyHandler)
 	s.mux.HandleFunc("/"+cfg.Endpoint+"/ws", s.tunnelHandler)
@@ -176,6 +189,25 @@ func New(cfg Config) (*Server, error) {
 		// We intentionally do *not* set ErrorLog → slog. The default
 		// behavior leaks little, and rerouting requires an io.Writer
 		// adapter that's noisy in tests.
+	}
+	// Explicitly hand HTTP/2 to x/net/http2 (rather than net/http's
+	// bundled copy). Two reasons: (1) wsraw flips an unexported var in
+	// x/net/http2 to enable RFC 8441 Extended CONNECT (Go issue
+	// #71128); (2) ConfigureServer first means stdlib's auto-h2 setup
+	// becomes a no-op for our listener. This must run before Serve.
+	//
+	// SETTINGS values are picked to match nginx 1.24.0 defaults so a
+	// passive observer reading the SETTINGS frame doesn't catch us
+	// out: MAX_FRAME_SIZE = 16384, MAX_CONCURRENT_STREAMS = 128. The
+	// only non-nginx-default value left in the frame is
+	// ENABLE_CONNECT_PROTOCOL = 1, which is load-bearing for v0.3 and
+	// documented in docs/design.md §15.1 as a known residual signal.
+	if err := http2.ConfigureServer(s.hsrv, &http2.Server{
+		IdleTimeout:          120 * time.Second,
+		MaxReadFrameSize:     16384,
+		MaxConcurrentStreams: 128,
+	}); err != nil {
+		return nil, fmt.Errorf("configure http/2: %w", err)
 	}
 	return s, nil
 }
@@ -211,6 +243,9 @@ func (s *Server) Run(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		s.log.Info("wisp server shutting down")
+		// Notify in-flight tunnel handlers first so they emit BYE before
+		// Shutdown closes their streams from under them.
+		s.shutdownCancel()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := s.hsrv.Shutdown(shutdownCtx); err != nil {
@@ -223,6 +258,7 @@ func (s *Server) Run(ctx context.Context) error {
 		<-errCh
 		return nil
 	case err := <-errCh:
+		s.shutdownCancel()
 		if errors.Is(err, http.ErrServerClosed) {
 			s.sessions.Close()
 			return nil

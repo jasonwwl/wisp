@@ -45,9 +45,17 @@ func (s *Server) decoyHandler(w http.ResponseWriter, r *http.Request) {
 // site" — decoy fall-through, tunnel-endpoint-without-token, tunnel
 // upgrade failure — go through here so a passive observer cannot
 // distinguish them by body length, headers, or content.
+//
+// X-Content-Type-Options is included here (not just in decoyHandler)
+// so a 404 reached via the tunnel path is byte-equal — including
+// header set — to a 404 reached via a random URL. Otherwise a probe
+// that compares the two response bodies and header lists side by
+// side would see the tunnel 404 missing this header and turn that
+// into a tell.
 func (s *Server) write404(w http.ResponseWriter) {
 	w.Header().Set("Server", "nginx/1.24.0")
 	w.Header().Set("Content-Type", "text/html; charset=UTF-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(http.StatusNotFound)
 	_, _ = w.Write([]byte(builtinNotFound))
 }

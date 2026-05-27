@@ -486,7 +486,7 @@ shell" URL in passive scans of the domain.
 
 ## 15. Open questions / future work
 
-### 15.1 HTTP/2 RFC 8441 WebSocket transport (top priority for v0.3)
+### 15.1 HTTP/2 RFC 8441 WebSocket transport (landed in v0.3)
 
 In a v0.2 NGFW dry-run against `wisp.shiyuehehu.com:8443` (active
 probes + JA3/JA4 + nmap service fingerprinting + 4×15s pcap captures
@@ -494,42 +494,89 @@ in `noshape` / `burst` / `chaff` modes), the only protocol-level signal
 that survived was **ALPN negotiating `http/1.1` only** while the
 domain otherwise looked like an ordinary 2025+ HTTPS site. Modern
 self-hosted services overwhelmingly default to `h2`. A single
-domain that only ever speaks `h1` is the load-bearing residual
-fingerprint after every other knob is turned on.
+domain that only ever speaks `h1` was the load-bearing residual
+fingerprint after every other knob was turned on.
 
-Sketch of what landing this requires:
+v0.3 closes that gap. The wisp server now advertises both `h2` and
+`http/1.1` in ALPN and the tunnel endpoint accepts WebSocket
+upgrades on either transport. The h1 path is preserved as a
+fallback for intermediaries that strip h2 ALPN.
 
-1. **Server-side ALPN policy.** Today the server forces ALPN to
-   `http/1.1` (see CLAUDE.md "Things that have bitten us"). The
-   listener's `tls.Config.NextProtos` should accept both `h2` and
-   `http/1.1`, and `http.Server` already serves both natively.
-2. **Tunnel endpoint over h2.** `/<endpoint>/ws` must accept
-   extended CONNECT requests as defined in RFC 8441
-   (`:method = CONNECT`, `:protocol = websocket`). The h1
-   `Upgrade: websocket` path stays as fallback for intermediaries
-   that strip h2.
-3. **Client uTLS + h2.** The current `internal/wsraw` package is
-   hand-rolled RFC 6455 over a hijacked HTTP/1.1 connection. h2
-   needs a different transport: the client uses `uTLS` for the
-   `ClientHello` then must speak h2 framing on top of the resulting
-   TLS connection. The realistic path is `x/net/http2` driving a
-   single stream after the uTLS handshake completes, with the
-   wsraw read/write helpers re-implemented against the h2 stream's
-   `io.ReadWriter`.
-4. **Pluggable transport seam.** A `wsraw.Transport` interface with
-   two implementations (`h1Upgrade`, `h2ExtendedConnect`) is the
-   minimum-disruption refactor. The frame / yamux / shape / session
-   layers above don't change.
-5. **Validation.** Re-run the NGFW probe panel; ALPN should
-   negotiate `h2` against a Chrome-mimicking client and the JA3/JA4
-   prefix should shift to `t13d-...-h2` (with #ciphers/#exts
-   matching modern Chrome). The decoy site continues to serve h1+h2
-   indistinguishably.
+What landed:
 
-Risk: this is the largest single piece of unfinished work in the
-v0.x line. wsraw is the protocol's load-bearing module; rewriting
-it past h2 is the only change in v0.x that needs a full e2e re-test
-matrix rather than just unit tests.
+1. **Server-side ALPN.** `internal/server/tls.go` puts `h2` ahead of
+   `http/1.1` in every `tls.Config.NextProtos`. ACME's listener also
+   keeps `acme-tls/1` so TLS-ALPN-01 challenges still resolve.
+2. **Server-side h2 stack.** `internal/server/server.go` explicitly
+   hands h2 to `golang.org/x/net/http2.ConfigureServer` rather than
+   net/http's bundled copy. This matters because wisp's linkname
+   flip (item 4) targets x/net/http2's package var; without
+   ConfigureServer first, net/http's bundle would win and Extended
+   CONNECT would still be off.
+3. **Tunnel dispatch.** `internal/server/tunnel.go` checks for an
+   RFC 8441 Extended CONNECT request shape (`:method = CONNECT`,
+   `:protocol = websocket`, `r.ProtoMajor == 2`) and routes to a
+   new `wsraw.AcceptH2Upgrade`. Falls through to the existing
+   `wsraw.AcceptUpgrade` (h1 hijack) when the shape doesn't match.
+4. **Extended CONNECT enable.** Go's x/net/http2 ships with RFC 8441
+   server-side support disabled by default pending upstream issue
+   #71128 — the toggle is a process-global `disableExtendedConnect
+   Protocol` variable controllable only via `GODEBUG=http2xconnect=1`.
+   That GODEBUG entry is unfortunately not registered with
+   runtime/godebug, so `//go:debug` directives reject it. wisp uses
+   `//go:linkname` from `internal/wsraw/wsraw_h2.go` to flip the var
+   to `false` at package init time. Tiny, surgical, removable in one
+   commit when upstream flips the default.
+5. **Client h2 transport.** `internal/wsraw/wsraw_h2.go` exposes
+   `dialH2`: drives `http2.Transport.NewClientConn` over the
+   already-handshaken uTLS connection, builds an Extended CONNECT
+   request with `:protocol=websocket`, and wraps `req.Body`/
+   `resp.Body` into the `io.ReadWriteCloser` shape `wsraw.Conn`
+   expects. The wsraw framing layer is otherwise unchanged: same
+   masked client frames, same opcode dispatch, same Ping/Pong
+   handling.
+6. **Server-side shutdown context.** `r.Context()` cancels on a
+   single-stream h2 disconnect, which would have evicted the
+   tunnel and broken `mode=resume`. The handler now selects on a
+   server-scoped `shutdownCtx` for the "BYE then evict" branch and
+   leaves transport-level peer-close to fall through `ysess.Close
+   Chan()` into the resume window.
+
+Wire stack inside an h2 connection (top → bottom):
+
+```
+yamux frame → wisp.Frame → wsraw binary msg → h2 DATA frame →
+HPACK-prefixed stream → TLS-1.3
+```
+
+ALPN now produces a JA4 prefix of `t13d-...-h2` against a Chrome-
+mimicking uTLS hello, with #ciphers/#exts matching real Chrome 120.
+The decoy site at `/` serves indistinguishably on either transport.
+
+Risk that paid off: wsraw is the protocol's load-bearing module.
+The frame layer was coalesced into a single Write per frame so h2
+DATA boundaries match h1 TCP segment boundaries. Full e2e tests
+cover both paths (`TestE2E_H2_ExtendedConnect`,
+`TestE2E_H2_LargeMessage`, `TestDial_H1Fallback_ServerOffersH1
+Only`, plus the existing `TestForward_*` matrix which now runs
+through h2 by default).
+
+Known residual signal: the server's HTTP/2 SETTINGS frame
+advertises `ENABLE_CONNECT_PROTOCOL = 1`. Real nginx 1.24.0 ships
+this as `0` because it has no RFC 8441 support. A deep-DPI NGFW
+that decrypts and inspects the SETTINGS frame would see this and
+have a one-bit "is the server a vanilla nginx, or something that
+also speaks Extended CONNECT?" classifier. We mitigate by aligning
+every other SETTINGS value to nginx defaults (MAX_FRAME_SIZE,
+MAX_CONCURRENT_STREAMS) so this is the *only* outlier, and by
+observing that modern reverse proxies (Envoy, Caddy, recent
+Cloudflare nodes) routinely set this bit too — the cohort the
+target ends up in is "modern HTTPS proxy", not "obviously a
+tunnel." If a future NGFW vendor adds a probe that combines
+"server claims `nginx/1.24.0` AND advertises ENABLE_CONNECT_
+PROTOCOL=1", we'll need to either lie about the Server header or
+strip the SETTINGS value at the cost of the h2 transport. Both
+are deferred until evidence of such a probe shows up in the wild.
 
 ### 15.2 Other longer-term ideas
 

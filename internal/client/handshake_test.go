@@ -18,6 +18,29 @@ import (
 	"github.com/jasonwwl/wisp/internal/server"
 )
 
+// TestServer_NegotiatesH2 is the v0.3 wire-level assertion: a TLS
+// client that offers ALPN ["h2","http/1.1"] must see the wisp server
+// pick "h2". A regression here means we've slipped back to v0.2-era
+// h1-only ALPN, which is the single residual fingerprint that v0.3
+// is built to remove.
+func TestServer_NegotiatesH2(t *testing.T) {
+	srv, host, _, _ := mustStartServer(t)
+	defer srv.Stop()
+
+	c, err := tls.Dial("tcp", host, &tls.Config{
+		InsecureSkipVerify: true,
+		ServerName:         "localhost",
+		NextProtos:         []string{"h2", "http/1.1"},
+	})
+	if err != nil {
+		t.Fatalf("tls.Dial: %v", err)
+	}
+	defer c.Close()
+	if got := c.ConnectionState().NegotiatedProtocol; got != "h2" {
+		t.Errorf("ALPN: got %q, want %q", got, "h2")
+	}
+}
+
 // TestForward_E2E starts a wisp server, dials a wisp client at it, runs
 // a local echo server as the tunnel target, then opens an outside TCP
 // connection to the server's public port and verifies the payload

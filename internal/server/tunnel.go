@@ -32,8 +32,10 @@ const (
 // tunnelHandler is the entry point for /<endpoint>/ws requests. After
 // authentication and the WebSocket upgrade, it dispatches to either the
 // fresh or resume path, then runs the data plane until lifecycle ends.
+// Supports both legacy h1 Upgrade (RFC 6455) and h2 Extended CONNECT
+// (RFC 8441); ALPN decides which one the peer used.
 func (s *Server) tunnelHandler(w http.ResponseWriter, r *http.Request) {
-	log := s.log.With("remote", r.RemoteAddr)
+	log := s.log.With("remote", r.RemoteAddr, "proto", r.Proto)
 
 	if !s.checkAuth(r) {
 		s.write404(w)
@@ -41,7 +43,16 @@ func (s *Server) tunnelHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	wsc, hijacked, err := wsraw.AcceptUpgrade(w, r)
+	var (
+		wsc      *wsraw.Conn
+		hijacked bool
+		err      error
+	)
+	if wsraw.IsH2WebSocket(r) {
+		wsc, hijacked, err = wsraw.AcceptH2Upgrade(w, r)
+	} else {
+		wsc, hijacked, err = wsraw.AcceptUpgrade(w, r)
+	}
 	if err != nil {
 		log.Warn("ws upgrade failed", "err", err, "hijacked", hijacked)
 		if !hijacked {
@@ -151,7 +162,7 @@ func (s *Server) tunnelHandler(w http.ResponseWriter, r *http.Request) {
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
-				if errors.Is(err, net.ErrClosed) || r.Context().Err() != nil {
+				if errors.Is(err, net.ErrClosed) || s.shutdownCtx.Err() != nil {
 					return
 				}
 				log.Warn("accept", "err", err)
@@ -174,7 +185,10 @@ func (s *Server) tunnelHandler(w http.ResponseWriter, r *http.Request) {
 	case <-ysess.CloseChan():
 		log.Info("yamux session closed")
 		// Default: entry slides into resume window via the deferred Unbind.
-	case <-r.Context().Done():
+		// On h2 this also fires when the client RSTs the stream because
+		// yamux observes the transport break a moment after r.Context()
+		// is canceled — kept on this branch deliberately so resume works.
+	case <-s.shutdownCtx.Done():
 		log.Info("server shutting down, closing tunnel")
 		_ = sendBye(wsc, protocol.ByeServerShutdown, "server shutdown")
 		s.sessions.Evict(entry.ID())

@@ -233,7 +233,15 @@ func writeFrame(w io.Writer, op Opcode, payload []byte, mask bool) error {
 		hidx = 10
 	}
 
-	var out []byte
+	// Build the full frame in one buffer and emit it with a single Write.
+	// On h2, two adjacent Writes can become two DATA frames; coalescing here
+	// keeps the wire-level frame layout deterministic across transports.
+	frameLen := hidx + len(payload)
+	if mask {
+		frameLen += 4
+	}
+	buf := make([]byte, frameLen)
+
 	if mask {
 		hdr[1] |= 0x80
 		var key [4]byte
@@ -242,24 +250,17 @@ func writeFrame(w io.Writer, op Opcode, payload []byte, mask bool) error {
 		}
 		copy(hdr[hidx:hidx+4], key[:])
 		hidx += 4
-		masked := make([]byte, len(payload))
-		for i := range payload {
-			masked[i] = payload[i] ^ key[i%4]
+		copy(buf, hdr[:hidx])
+		for i, b := range payload {
+			buf[hidx+i] = b ^ key[i%4]
 		}
-		out = masked
 	} else {
-		out = payload
+		copy(buf, hdr[:hidx])
+		copy(buf[hidx:], payload)
 	}
 
-	if _, err := w.Write(hdr[:hidx]); err != nil {
-		return err
-	}
-	if len(out) > 0 {
-		if _, err := w.Write(out); err != nil {
-			return err
-		}
-	}
-	return nil
+	_, err := w.Write(buf)
+	return err
 }
 
 // --- server-side handshake ---
@@ -344,7 +345,9 @@ type DialOptions struct {
 }
 
 // Dial connects to a WebSocket endpoint over TLS and returns a client-side
-// Conn. The default User-Agent matches a current Chrome on Linux.
+// Conn. The default User-Agent matches a current Chrome on Linux. ALPN is
+// allowed to negotiate either "h2" or "http/1.1"; on h2, the WebSocket
+// rides RFC 8441 Extended CONNECT.
 func Dial(opts DialOptions) (*Conn, error) {
 	u, err := url.Parse(opts.URL)
 	if err != nil {
@@ -365,11 +368,12 @@ func Dial(opts DialOptions) (*Conn, error) {
 	if tlsCfg.ServerName == "" {
 		tlsCfg.ServerName = u.Hostname()
 	}
-	// Browsers performing a WebSocket upgrade only negotiate http/1.1 at
-	// ALPN time: they know they will need Connection: Upgrade semantics,
-	// which HTTP/2 does not provide (RFC 8441 is rarely supported).
 	if tlsCfg.NextProtos == nil {
-		tlsCfg.NextProtos = []string{"http/1.1"}
+		// Match real Chrome's ALPN extension. The uTLS auto profiles
+		// hardcode ["h2", "http/1.1"] in the ClientHello anyway; we
+		// set the same here for the rare callers driving the raw TLS
+		// path. The server picks; we dispatch on the result.
+		tlsCfg.NextProtos = []string{"h2", "http/1.1"}
 	}
 
 	tcpConn, err := dialUTLS(host, tlsCfg, opts.HelloID)
@@ -377,6 +381,30 @@ func Dial(opts DialOptions) (*Conn, error) {
 		return nil, fmt.Errorf("tls dial %s: %w", host, err)
 	}
 
+	switch negotiatedALPN(tcpConn) {
+	case "h2":
+		return dialH2(tcpConn, u, opts)
+	default:
+		return dialH1Upgrade(tcpConn, u, opts)
+	}
+}
+
+// negotiatedALPN returns the protocol the TLS handshake settled on. We
+// look through anything that wraps a *utls.UConn or *tls.Conn.
+func negotiatedALPN(c net.Conn) string {
+	type alpnReporter interface {
+		ConnectionState() utls.ConnectionState
+	}
+	if r, ok := c.(alpnReporter); ok {
+		return r.ConnectionState().NegotiatedProtocol
+	}
+	return ""
+}
+
+// dialH1Upgrade implements RFC 6455 over the legacy HTTP/1.1 Upgrade
+// dance. It is also the v0.1/v0.2 wsraw client path; kept for
+// intermediaries that strip h2 ALPN.
+func dialH1Upgrade(tcpConn net.Conn, u *url.URL, opts DialOptions) (*Conn, error) {
 	keyRaw := make([]byte, 16)
 	if _, err := rand.Read(keyRaw); err != nil {
 		_ = tcpConn.Close()

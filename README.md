@@ -213,11 +213,19 @@ Landed since `v0.1` on `main` (will ship as `v0.2`):
   long-silence-then-burst pattern). Both off by default;
   `--shape burst,chaff` or `--shape all` enables both.
 
+Landed since `v0.2` on `main` (will ship as `v0.3`):
+
+- HTTP/2 WebSocket transport (RFC 8441 Extended CONNECT). ALPN now
+  negotiates `h2` by default against a Chrome-mimicking client; the
+  legacy h1 Upgrade path remains as a fallback for intermediaries
+  that strip h2. Closes the v0.2 NGFW probe-panel finding that
+  ALPN-h1-only was the last residual fingerprint. See
+  [`docs/design.md`](docs/design.md) §15.1.
+
 Still deferred to a future release:
 
 - HELLO nonce verification
 - Windows `--detach`
-- HTTP/2 RFC 8441 WebSocket transport (current is HTTP/1.1 only)
 
 ## License
 

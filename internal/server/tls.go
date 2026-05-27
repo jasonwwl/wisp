@@ -27,10 +27,12 @@ func resolveTLS(cfg Config, acme *acmeRuntime) (*tls.Config, error) {
 	}
 	if acme != nil {
 		// autocert.Manager.GetCertificate handles both regular ServerName
-		// SNI and TLS-ALPN-01 challenges (via "acme-tls/1" ALPN).
+		// SNI and TLS-ALPN-01 challenges (via "acme-tls/1" ALPN). We
+		// advertise h2 first to match a modern HTTPS site; the tunnel
+		// endpoint supports both h2 Extended CONNECT and h1 Upgrade.
 		return &tls.Config{
 			GetCertificate: acme.manager.GetCertificate,
-			NextProtos:     []string{"http/1.1", "acme-tls/1"},
+			NextProtos:     []string{"h2", "http/1.1", "acme-tls/1"},
 			MinVersion:     tls.VersionTLS12,
 		}, nil
 	}
@@ -52,17 +54,16 @@ func resolveTLS(cfg Config, acme *acmeRuntime) (*tls.Config, error) {
 }
 
 // baseTLSConfig returns the shared *tls.Config we use for every wisp
-// listener. We pin ALPN to "http/1.1" so the tunnel endpoint (which
-// requires HTTP/1.1 Upgrade semantics) is never negotiated as HTTP/2 —
-// real WebSocket-over-HTTP/2 (RFC 8441) would need a separate
-// implementation, and selective per-path ALPN is not a thing in TLS.
-// The decoy site is content with HTTP/1.1; small self-hosted sites
-// commonly run that way.
+// listener. We advertise h2 first then http/1.1: a 2025+ HTTPS site
+// almost always defaults to h2, so a single-domain h1-only fingerprint
+// would itself be a tell. The tunnel endpoint dispatches between RFC
+// 8441 Extended CONNECT (on h2) and the legacy h1 Upgrade in
+// tunnelHandler; the decoy site serves both transparently.
 func baseTLSConfig(cert tls.Certificate) *tls.Config {
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS12,
-		NextProtos:   []string{"http/1.1"},
+		NextProtos:   []string{"h2", "http/1.1"},
 	}
 }
 
