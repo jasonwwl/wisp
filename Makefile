@@ -43,7 +43,7 @@ $(PLATFORMS):
 	@os=$$(echo $@ | cut -d/ -f1); arch=$$(echo $@ | cut -d/ -f2); \
 	ext=$$([ "$$os" = windows ] && echo .exe || echo ""); \
 	echo "  build  dist/wisp-$$os-$$arch$$ext"; \
-	GOOS=$$os GOARCH=$$arch $(GO) build $(GOFLAGS) -ldflags="$(LDFLAGS)" \
+	GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 $(GO) build $(GOFLAGS) -ldflags="$(LDFLAGS)" \
 		-o dist/wisp-$$os-$$arch$$ext ./cmd/wisp
 
 help:
