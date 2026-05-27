@@ -36,6 +36,7 @@ func exposeFlags(opts *exposeOpts) *flag.FlagSet {
 	fs.StringVar(&opts.server, "server", "", "wisp server (host or host:port)")
 	fs.StringVar(&opts.server, "s", "", "alias for --server")
 	fs.StringVar(&opts.endpoint, "endpoint", "", "tunnel path segment configured on the server")
+	fs.StringVar(&opts.endpoint, "e", "", "alias for --endpoint")
 	fs.StringVar(&opts.token, "token", os.Getenv("WISP_TOKEN"), "bearer token (env: WISP_TOKEN)")
 	fs.StringVar(&opts.token, "t", os.Getenv("WISP_TOKEN"), "alias for --token")
 	fs.StringVar(&opts.to, "to", "127.0.0.1:22", "local TCP target to expose")
