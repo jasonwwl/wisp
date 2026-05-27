@@ -201,19 +201,23 @@ $ sudo systemctl enable --now wisp
 - 服务端公网端口分配器(固定段或内核临时端口)
 - TTL 强制 + 优雅 BYE
 - Unix 下 `--detach` 守护进程化,关 PTY 不掉
-- **从 v0.1 起在 `main` 上落地(将作为 v0.2 发布):**
+- **v0.2 落地:**
   - 5 分钟会话恢复窗口:网络抖动不掉隧道,重连后是同一个公网端口。
     `--no-resume` 可退回 v0.1 行为
   - 流量整形 opt-in: `--shape burst` 在 10ms 窗口内合并 yamux 帧(平滑
     SSH 击键节奏);`--shape chaff` 空闲时低速发零负载 Ping 帧(掩盖
     "长静默后突发"模式)。默认都不开;`--shape burst,chaff` 或
     `--shape all` 同时打开
+- **v0.3 落地:**
+  - HTTP/2 WebSocket 传输 (RFC 8441 Extended CONNECT)。默认 ALPN
+    协商 `h2`,以 Chrome 风格的 ClientHello 接入;保留 h1 Upgrade 路径
+    作为剥离 h2 的中间盒兜底。这一改动关掉了 v0.2 NGFW 实测剩下的最后
+    一条指纹:"ALPN 只协商 http/1.1"。详见 [`docs/design.md`](docs/design.md) §15.1。
 
 仍然推迟的:
 
 - HELLO nonce 验证
 - Windows 下 `--detach`
-- HTTP/2 RFC 8441 WebSocket 传输(当前只有 HTTP/1.1)
 
 ## 许可证
 

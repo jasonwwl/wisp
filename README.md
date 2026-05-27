@@ -202,7 +202,7 @@ Working:
 - TTL enforcement with orderly BYE
 - Unix `--detach` daemonization that survives PTY close
 
-Landed since `v0.1` on `main` (will ship as `v0.2`):
+Landed in v0.2:
 
 - 5-minute session resume window: a transient WS drop is transparent;
   the client redials with the same session id and gets the same public
@@ -213,7 +213,7 @@ Landed since `v0.1` on `main` (will ship as `v0.2`):
   long-silence-then-burst pattern). Both off by default;
   `--shape burst,chaff` or `--shape all` enables both.
 
-Landed since `v0.2` on `main` (will ship as `v0.3`):
+Landed in v0.3:
 
 - HTTP/2 WebSocket transport (RFC 8441 Extended CONNECT). ALPN now
   negotiates `h2` by default against a Chrome-mimicking client; the
