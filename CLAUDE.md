@@ -141,18 +141,17 @@ in wisp.Frame envelopes with their own `Type`.
 
 ## What's deferred and why
 
-These are intentionally not in v0.1:
+These are intentionally not in v0.1, and not all are done yet in v0.2:
 
-- **Session resume window** (5 min). The protocol already carries a
-  session_id; the server just doesn't keep state across WS drop yet.
 - **HELLO nonce verification.** The server reads it but doesn't yet
   bind subsequent frames to it.
-- **`--shape burst` / `--shape chaff`.** Padding is on by default;
-  burst-smoothing and chaff frames need an interactive workload (SSH)
-  to validate against.
 - **Windows `--detach`.** Re-exec with `DETACHED_PROCESS` works but
   needs `golang.org/x/sys/windows`; not yet worth adding.
-- **HTTP/2 RFC 8441 transport.** See pitfall above.
+- **HTTP/2 RFC 8441 transport.** See pitfall above. **Top priority for
+  v0.3** — NGFW probe panel against `wisp.shiyuehehu.com` confirmed
+  ALPN h1-only is the load-bearing residual fingerprint after every
+  other shape knob is on. Implementation sketch in
+  [`docs/design.md`](docs/design.md) §15.1.
 
 ## Pointers
 

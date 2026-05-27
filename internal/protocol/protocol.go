@@ -7,12 +7,19 @@
 //
 // Wire layouts (all sizes in bytes):
 //
-//	Hello (>= 54 bytes):
+//	Hello (>= 55 bytes):
 //	  0..31    session_id        [32]
 //	  32..47   nonce             [16]
 //	  48..51   requested_ttl_sec uint32
 //	  52..53   target_len        uint16
 //	  54..     target            target_len bytes (ASCII)
+//	  54+tl    mode              uint8 (HelloModeFresh = 0,
+//	                                    HelloModeResume = 1)
+//
+// The trailing mode byte is an append-only v0.2 extension: a v0.1
+// peer that produced a 54+tl-byte HELLO is decoded as mode=fresh; a
+// v0.1 peer that receives a 55+tl-byte HELLO ignores the trailing
+// byte (its decoder did not validate trailing-byte presence).
 //
 //	HelloAck (>= 26 bytes):
 //	  0..1     port              uint16
@@ -43,8 +50,18 @@ const (
 	AckPortsExhausted AckCode = 1
 	AckBadHello       AckCode = 2
 	AckInternalError  AckCode = 3
-	AckResumeNotFound AckCode = 4 // reserved
+	AckResumeNotFound AckCode = 4
 	AckTTLOutOfRange  AckCode = 5 // reserved
+)
+
+// HelloMode is the trailing flag byte on HELLO. It tells the server
+// whether the client is starting a brand-new session or trying to
+// re-attach to an existing one within its resume window.
+type HelloMode uint8
+
+const (
+	HelloModeFresh  HelloMode = 0
+	HelloModeResume HelloMode = 1
 )
 
 // ByeCode classifies orderly shutdown reasons.
@@ -75,6 +92,7 @@ type Hello struct {
 	Nonce        [16]byte
 	RequestedTTL uint32 // seconds
 	Target       string // free-form, ASCII (e.g. "127.0.0.1:22"); informational
+	Mode         HelloMode
 }
 
 // Encode returns the wire bytes for h.
@@ -82,16 +100,18 @@ func (h *Hello) Encode() ([]byte, error) {
 	if len(h.Target) > MaxTargetLen {
 		return nil, fmt.Errorf("%w: target %d > %d", ErrLengthCap, len(h.Target), MaxTargetLen)
 	}
-	buf := make([]byte, 54+len(h.Target))
+	buf := make([]byte, 55+len(h.Target))
 	copy(buf[0:32], h.SessionID[:])
 	copy(buf[32:48], h.Nonce[:])
 	binary.BigEndian.PutUint32(buf[48:52], h.RequestedTTL)
 	binary.BigEndian.PutUint16(buf[52:54], uint16(len(h.Target)))
-	copy(buf[54:], h.Target)
+	copy(buf[54:54+len(h.Target)], h.Target)
+	buf[54+len(h.Target)] = byte(h.Mode)
 	return buf, nil
 }
 
-// DecodeHello parses h from wire bytes.
+// DecodeHello parses h from wire bytes. A v0.1 peer's 54+tl-byte HELLO
+// (no trailing mode byte) decodes with Mode = HelloModeFresh.
 func DecodeHello(b []byte) (*Hello, error) {
 	if len(b) < 54 {
 		return nil, fmt.Errorf("%w: hello %d < 54", ErrShortBuffer, len(b))
@@ -107,6 +127,9 @@ func DecodeHello(b []byte) (*Hello, error) {
 	copy(h.SessionID[:], b[0:32])
 	copy(h.Nonce[:], b[32:48])
 	h.Target = string(b[54 : 54+tl])
+	if len(b) >= 54+tl+1 {
+		h.Mode = HelloMode(b[54+tl])
+	}
 	return h, nil
 }
 

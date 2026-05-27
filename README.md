@@ -1,5 +1,7 @@
 # wisp
 
+English · [中文](README_zh.md)
+
 > Ephemeral reverse TCP tunnels. One line. TLS by default. TTL-bound. No config files.
 
 ```bash
@@ -200,11 +202,20 @@ Working:
 - TTL enforcement with orderly BYE
 - Unix `--detach` daemonization that survives PTY close
 
-Deferred to `v0.2`:
+Landed since `v0.1` on `main` (will ship as `v0.2`):
 
-- 5-minute session resume window
+- 5-minute session resume window: a transient WS drop is transparent;
+  the client redials with the same session id and gets the same public
+  port back. `--no-resume` returns to v0.1 single-shot behaviour.
+- Traffic shaping opt-ins: `--shape burst` coalesces yamux frames in a
+  10 ms window (smooths the SSH-keystroke cadence); `--shape chaff`
+  emits low-rate dummy Ping frames during idle periods (hides the
+  long-silence-then-burst pattern). Both off by default;
+  `--shape burst,chaff` or `--shape all` enables both.
+
+Still deferred to a future release:
+
 - HELLO nonce verification
-- Traffic-shape `--shape burst` and `--shape chaff`
 - Windows `--detach`
 - HTTP/2 RFC 8441 WebSocket transport (current is HTTP/1.1 only)
 

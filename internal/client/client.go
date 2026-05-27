@@ -18,14 +18,30 @@ import (
 	"log/slog"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/yamux"
 	"github.com/jasonwwl/wisp/internal/frame"
 	"github.com/jasonwwl/wisp/internal/mux"
 	"github.com/jasonwwl/wisp/internal/protocol"
+	"github.com/jasonwwl/wisp/internal/shape"
 	"github.com/jasonwwl/wisp/internal/wsraw"
 )
+
+// AckError is returned by Dial when the server completed the WebSocket
+// upgrade but rejected the HELLO with a non-OK ack code. Callers (most
+// importantly Session.Run) can switch on Code to decide policy: a
+// resume-not-found is terminal, a transient port-bind failure is not
+// retried because the server already evicted the session.
+type AckError struct {
+	Code    protocol.AckCode
+	Message string
+}
+
+func (e *AckError) Error() string {
+	return fmt.Sprintf("server hello_ack code %d: %s", e.Code, e.Message)
+}
 
 // Config configures a single Dial.
 type Config struct {
@@ -48,8 +64,27 @@ type Config struct {
 	TTL time.Duration
 
 	// SessionID is the resume id. Empty generates a fresh 32-byte
-	// base64url id.
+	// base64url id. When InitialMode == HelloModeResume this must be
+	// the id of a server-side session inside its resume window.
 	SessionID string
+
+	// InitialMode is the HELLO mode used on the very first Dial. Defaults
+	// to HelloModeFresh. Set to HelloModeResume (with non-empty SessionID)
+	// to attach to an existing server-side session — typically after a
+	// daemon restart.
+	InitialMode protocol.HelloMode
+
+	// AutoResume, when true, makes Session.Run reconnect with mode=resume
+	// on transient WS/yamux death. Network errors get exponential backoff;
+	// any non-OK ack from the server is terminal (a re-attempt cannot
+	// succeed since the server's view is authoritative).
+	AutoResume bool
+
+	// Shape selects traffic-shaping primitives applied to the outbound
+	// wsraw write path. Zero value (both bits false) is v0.1 pass-through.
+	// Burst coalesces small frames within a short window; Chaff emits
+	// low-rate dummy frames during idle periods. See docs/design.md §7.
+	Shape shape.Mode
 
 	// InsecureSkipVerify disables TLS certificate verification.
 	// Development use only.
@@ -60,11 +95,14 @@ type Config struct {
 }
 
 // Session is an established wisp tunnel. The handshake is complete;
-// data plane is live; call Forward to start the accept-and-dial loop.
+// data plane is live; call Forward (or Run for auto-resume) to start
+// the accept-and-dial loop.
 type Session struct {
 	cfg    Config
 	wsConn *wsraw.Conn
 	ysess  *yamux.Session
+
+	closeOnce sync.Once
 
 	// Negotiated parameters returned by the server.
 	SessionID  string
@@ -150,6 +188,7 @@ func Dial(ctx context.Context, cfg Config) (*Session, error) {
 	hello := &protocol.Hello{
 		RequestedTTL: uint32(cfg.TTL.Seconds()),
 		Target:       cfg.LocalTarget,
+		Mode:         cfg.InitialMode,
 	}
 	if err := decodeSessionID(cfg.SessionID, &hello.SessionID); err != nil {
 		close(handshakeDone)
@@ -187,7 +226,7 @@ func Dial(ctx context.Context, cfg Config) (*Session, error) {
 	}
 	if ack.Code != protocol.AckOK {
 		_ = wsc.Close()
-		return nil, fmt.Errorf("server rejected hello (code %d): %s", ack.Code, ack.Message)
+		return nil, &AckError{Code: ack.Code, Message: ack.Message}
 	}
 
 	// Reset deadlines for the data plane.
@@ -195,7 +234,15 @@ func Dial(ctx context.Context, cfg Config) (*Session, error) {
 	_ = wsc.SetWriteDeadline(time.Time{})
 
 	// Build yamux client session on top of the wsraw conn.
-	adapter := mux.New(wsc, 64, "server")
+	var adapter *mux.Adapter
+	if cfg.Shape.Empty() {
+		adapter = mux.New(wsc, 64, "server")
+	} else {
+		adapter = mux.NewWithShape(wsc, 64, "server", shape.Config{
+			Mode:       cfg.Shape,
+			MaxPayload: frame.MaxPayload - 64, // leave headroom for header + padding
+		})
+	}
 	ycfg := yamux.DefaultConfig()
 	ycfg.LogOutput = io.Discard
 	ycfg.EnableKeepAlive = true
@@ -220,6 +267,110 @@ func Dial(ctx context.Context, cfg Config) (*Session, error) {
 		PublicPort: ack.Port,
 		GrantedTTL: time.Duration(ack.GrantedTTL) * time.Second,
 	}, nil
+}
+
+// Run is Forward plus auto-resume. When Config.AutoResume is false it
+// is identical to Forward. Otherwise it reconnects with mode=resume on
+// transient WS/yamux death, retrying network errors with exponential
+// backoff and bailing out on any non-OK ack from the server (a value
+// the server is authoritative about).
+//
+// Run returns nil on ctx cancellation, TTL exhaustion, or server-side
+// session termination (BYE → BindResume → AckResumeNotFound). It
+// returns the underlying ack error for other terminal cases so callers
+// can render a useful message.
+func (s *Session) Run(ctx context.Context) error {
+	if !s.cfg.AutoResume {
+		return s.Forward(ctx)
+	}
+
+	// Wall-clock cap on retries: when the original grant elapses,
+	// further resume attempts cannot succeed anyway. Slack the
+	// deadline by 5s so a client whose clock drifts slightly ahead
+	// still hands the server a chance to refuse cleanly.
+	deadline := time.Now().Add(s.GrantedTTL).Add(5 * time.Second)
+
+	current := s
+	for {
+		forwardErr := current.Forward(ctx)
+		_ = forwardErr // intentionally ignored; resume decides what to do
+
+		if ctx.Err() != nil {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			current.cfg.Logger.Info("tunnel ttl exhausted, exiting auto-resume")
+			return nil
+		}
+
+		current.cfg.Logger.Info("connection lost, attempting resume",
+			"session", current.SessionID,
+		)
+
+		next, err := redialResume(ctx, current.cfg, current.SessionID, deadline)
+		if err != nil {
+			return err
+		}
+		if next == nil {
+			// ctx canceled or deadline reached inside backoff; either way exit clean.
+			return nil
+		}
+		current = next
+	}
+}
+
+// redialResume reconnects with mode=resume, backing off exponentially
+// on transport-layer errors and short-circuiting on AckError (which
+// the server has no way to retract). Returns (nil, nil) when ctx ends
+// or the wall-clock deadline arrives mid-backoff; (nil, *AckError) for
+// terminal server refusals; (sess, nil) on success.
+func redialResume(ctx context.Context, base Config, sessionID string, deadline time.Time) (*Session, error) {
+	backoff := time.Second
+	const maxBackoff = 30 * time.Second
+
+	cfg := base
+	cfg.SessionID = sessionID
+	cfg.InitialMode = protocol.HelloModeResume
+	cfg.AutoResume = false // redialResume is the resume primitive itself
+
+	for {
+		dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		sess, err := Dial(dialCtx, cfg)
+		cancel()
+		if err == nil {
+			return sess, nil
+		}
+		if ctx.Err() != nil {
+			return nil, nil
+		}
+
+		var ackErr *AckError
+		if errors.As(err, &ackErr) {
+			base.Logger.Info("resume rejected by server",
+				"code", ackErr.Code,
+				"msg", ackErr.Message,
+			)
+			return nil, err
+		}
+
+		if !time.Now().Add(backoff).Before(deadline) {
+			base.Logger.Info("tunnel ttl exhausted during resume backoff")
+			return nil, nil
+		}
+		base.Logger.Warn("resume dial failed, retrying",
+			"err", err,
+			"backoff", backoff,
+		)
+		select {
+		case <-ctx.Done():
+			return nil, nil
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
 }
 
 // Forward blocks accepting yamux streams from the server, dialing the
@@ -265,14 +416,17 @@ func (s *Session) forwardOne(stream net.Conn) {
 	s.cfg.Logger.Info("stream closed")
 }
 
-// Close tears the session down. Safe to call multiple times.
+// Close tears the session down. Safe to call multiple times and from
+// multiple goroutines.
 func (s *Session) Close() error {
-	if s.ysess != nil {
-		_ = s.ysess.Close()
-	}
-	if s.wsConn != nil {
-		_ = s.wsConn.Close()
-	}
+	s.closeOnce.Do(func() {
+		if s.ysess != nil {
+			_ = s.ysess.Close()
+		}
+		if s.wsConn != nil {
+			_ = s.wsConn.Close()
+		}
+	})
 	return nil
 }
 

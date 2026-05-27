@@ -37,6 +37,16 @@ func (s *Server) decoyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.write404(w)
+}
+
+// write404 is the single emission point for nginx-style 404 responses.
+// All paths that need to look like a "wrong URL on an ordinary nginx
+// site" — decoy fall-through, tunnel-endpoint-without-token, tunnel
+// upgrade failure — go through here so a passive observer cannot
+// distinguish them by body length, headers, or content.
+func (s *Server) write404(w http.ResponseWriter) {
+	w.Header().Set("Server", "nginx/1.24.0")
 	w.Header().Set("Content-Type", "text/html; charset=UTF-8")
 	w.WriteHeader(http.StatusNotFound)
 	_, _ = w.Write([]byte(builtinNotFound))
