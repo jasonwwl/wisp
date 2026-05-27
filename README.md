@@ -44,9 +44,11 @@ A self-hostable, single-binary, TLS-tunneled reverse TCP relay with
 - **TLS on 443, real certificate.** Looks and behaves like an HTTPS
   endpoint. No stunnel, no nginx in front, no `-k` to swallow self-signed
   warnings.
-- **One line to start, one keystroke to stop.** The client daemonizes
-  itself, prints the public address, then gets out of your way. `Ctrl-C`,
-  or the TTL, ends the session and closes every connection through it.
+- **Foreground by default; `--detach` when you need it.** Run wisp in
+  the foreground and stop it with `Ctrl-C`; or add `--detach` to fork
+  it into a real daemon that survives the parent terminal — useful in
+  vendor web terminals or captive bastion sessions where closing the
+  browser tab would otherwise kill the process.
 - **Session resume.** Lost your SSH? Re-run the same command with
   `--resume <id>` within five minutes and you get the same public port
   back.

@@ -329,49 +329,73 @@ The defaults are tuned to be plausible without paying latency.
 
 ## 8. Daemonization
 
-The client must outlive the shell that started it. This is harder than
-it sounds on the kinds of constrained PTYs we target (vendor web
-terminals, captive sessions over a bastion).
+The client must be able to outlive the shell that started it on demand.
+This matters most in constrained PTYs (vendor web terminals, captive
+sessions over a bastion) where closing the browser tab sends `SIGHUP`
+to every member of the controlling process group.
 
-### 8.1 Unix
+The default is **foreground**: `wisp expose ...` runs attached, prints
+the tunnel summary to stdout, and `Ctrl-C` stops it. This is the
+expected shape of a Go CLI tool and matches the systemd / supervisor
+ecosystem. Pass `--detach` to switch to daemon mode.
 
-The wisp client, when invoked from a terminal, performs the standard
-double-fork:
+### 8.1 Unix (`--detach`)
 
-1. `fork()` once. Parent exits, printing the child's PID.
-2. Child calls `setsid()` to detach from the controlling TTY.
-3. Child `fork()`s again. Intermediate exits.
-4. Final grandchild `chdir("/")`, closes stdin/stdout/stderr (or
-   redirects them to `--log-file`, default `~/.wisp/<session>.log`),
-   and writes `~/.wisp/<session>.pid`.
+We do not perform the classic in-process double-fork — the Go runtime
+will not survive bare `fork()` because internal state (GC, scheduler,
+ten-some threads) is not duplicated cleanly. Instead the launcher
+re-execs the wisp binary as a new process with `setsid` set, then
+exchanges a one-shot ready report over an inherited pipe:
 
-The parent of the original invocation prints:
+1. Launcher opens `~/.wisp/wisp-<timestamp>.log`, creates `os.Pipe()`,
+   writes a fresh PID file path.
+2. Launcher `exec.Command(os.Args[0], os.Args[1:]...)` with:
+   - `env += WISP_DAEMONIZED=1, WISP_READY_FD=3`
+   - `Stdin=nil, Stdout=Stderr=logFile`
+   - `ExtraFiles=[]*os.File{pipeWriteEnd}` (becomes fd 3 in the child)
+   - `SysProcAttr.Setsid=true` (the child becomes session leader,
+     SIGHUP from the launcher's PTY no longer reaches it)
+3. Launcher decodes one JSON `readyMessage{ok, port, session, ttl, ...}`
+   from the read end of the pipe, with a 35s deadline. On success it
+   `Release()`s the child handle and exits cleanly.
+4. The child sees `WISP_DAEMONIZED=1`, knows it is the daemon, runs
+   the normal `Dial+Forward` flow, and writes the ready report to fd 3
+   as soon as the HELLO_ACK arrives.
+
+The launcher prints, before exit:
 
 ```
-wisp expose: session=abc... public=wisp.example.com:22017 ttl=1h00m
-            pid=12345 log=~/.wisp/abc.log
-            stop: kill 12345  |  or wait 1h00m for auto-shutdown
+wisp: tunnel started in background
+  pid:     12345
+  public:  wisp.example.com:22017
+  session: abc...
+  ttl:     600s
+  log:     ~/.wisp/wisp-20260527-115752.log
+  pidfile: ~/.wisp/wisp-20260527-115752.pid
+  stop:    kill 12345
 ```
 
-`--foreground` disables daemonization for systemd-style supervision.
+After the launcher exits, the daemon has `PPID=1` (reparented to init),
+its own session/process-group (`setsid`), and writes to the log file.
+Closing the PTY does not affect it.
 
 ### 8.2 Windows
 
-Daemonization on Windows uses `CreateProcessW` with `DETACHED_PROCESS
-| CREATE_NEW_PROCESS_GROUP` and an explicit redirect of standard
-handles. The behavior of `~/.wisp/...` paths is the same; the log
-file location uses `%LOCALAPPDATA%\wisp\`.
+Not implemented in v0. The pattern (`CreateProcessW` with
+`DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`) requires
+`golang.org/x/sys/windows`, which we have so far avoided. For now,
+Windows users should run wisp under a service manager (NSSM,
+`sc.exe`) or keep the terminal window open.
 
-### 8.3 Macros for hostile terminals
+### 8.3 Hostile-terminal edge cases
 
 Some web terminals send `SIGHUP` to the foreground process group on
-disconnect *before* `setsid` can be observed by the parent process
-(this is a race window when the PTY is closed within milliseconds of
-process start). The client mitigates by:
-
-- Ignoring `SIGHUP` until daemonization completes.
-- Falling back to `nohup`-equivalent `signal(SIGHUP, SIG_IGN)` if
-  the fork dance is interrupted.
+disconnect *before* the daemon child reports ready (this is a race
+window when the PTY is closed within milliseconds of process start).
+With the re-exec approach above, the daemon child has already called
+`setsid()` (via `SysProcAttr.Setsid=true`) before `Start()` returns,
+so the PTY's `SIGHUP` no longer reaches it — the race window is
+effectively closed.
 
 ## 9. Port allocation
 
