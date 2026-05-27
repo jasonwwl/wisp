@@ -65,6 +65,26 @@ type Config struct {
 	// with --insecure-dev to trust it.
 	TLSAutoSelfSigned bool
 
+	// ACMEEnabled, if true, obtains and auto-renews a Let's Encrypt
+	// certificate for Domain via golang.org/x/crypto/acme/autocert.
+	// Mutually exclusive with TLSCert/TLSKey and TLSAutoSelfSigned.
+	ACMEEnabled bool
+
+	// ACMEEmail is the contact email for the ACME account. Optional but
+	// recommended (Let's Encrypt sends expiry reminders if renewal stops).
+	ACMEEmail string
+
+	// ACMECacheDir is the on-disk path where autocert persists issued
+	// certificates, ACME account keys, and challenge state. Must survive
+	// process restarts to avoid re-issuance and rate limits.
+	ACMECacheDir string
+
+	// ACMEHTTPListen, if non-empty, starts a separate HTTP listener on
+	// that address for HTTP-01 challenges (typical: ":80"). If empty,
+	// only TLS-ALPN-01 challenges work — fine on most modern networks
+	// but requires nothing else on :443.
+	ACMEHTTPListen string
+
 	// Logger is the structured logger. Defaults to slog.Default().
 	Logger *slog.Logger
 }
@@ -76,6 +96,7 @@ type Server struct {
 	log   *slog.Logger
 	mux   *http.ServeMux
 	ports *PortAllocator
+	acme  *acmeRuntime
 }
 
 // New validates cfg and returns a ready-to-Run Server.
@@ -108,7 +129,17 @@ func New(cfg Config) (*Server, error) {
 		cfg.Logger = slog.Default()
 	}
 
-	tlsCfg, err := resolveTLS(cfg)
+	// Set up ACME first because resolveTLS may need its GetCertificate hook.
+	var acme *acmeRuntime
+	if cfg.ACMEEnabled {
+		var aerr error
+		acme, aerr = setupACME(cfg)
+		if aerr != nil {
+			return nil, aerr
+		}
+	}
+
+	tlsCfg, err := resolveTLS(cfg, acme)
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +149,7 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 
-	s := &Server{cfg: cfg, log: cfg.Logger, mux: http.NewServeMux(), ports: alloc}
+	s := &Server{cfg: cfg, log: cfg.Logger, mux: http.NewServeMux(), ports: alloc, acme: acme}
 	s.mux.HandleFunc("/", s.decoyHandler)
 	s.mux.HandleFunc("/"+cfg.Endpoint+"/ws", s.tunnelHandler)
 
@@ -142,15 +173,20 @@ func (s *Server) Endpoint() string { return s.cfg.Endpoint }
 // actual bound address is available on the underlying http.Server.
 func (s *Server) Addr() string { return s.cfg.Listen }
 
-// Run starts the TLS listener and blocks until ctx is canceled or the
-// server returns an error. On ctx cancel, Run performs a graceful
-// Shutdown.
+// Run starts the TLS listener (and the optional ACME HTTP-01 listener)
+// and blocks until ctx is canceled or the server returns an error. On
+// ctx cancel, Run performs a graceful Shutdown.
 func (s *Server) Run(ctx context.Context) error {
 	s.log.Info("wisp server starting",
 		"listen", s.cfg.Listen,
 		"domain", s.cfg.Domain,
 		"endpoint", s.cfg.Endpoint,
+		"acme", s.acme != nil,
 	)
+
+	if s.acme != nil && s.cfg.ACMEHTTPListen != "" {
+		s.acme.startHTTP01(s.cfg.ACMEHTTPListen, s.log)
+	}
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -165,7 +201,9 @@ func (s *Server) Run(ctx context.Context) error {
 		if err := s.hsrv.Shutdown(shutdownCtx); err != nil {
 			return fmt.Errorf("shutdown: %w", err)
 		}
-		// drain ListenAndServe's error
+		if s.acme != nil {
+			_ = s.acme.Shutdown(shutdownCtx)
+		}
 		<-errCh
 		return nil
 	case err := <-errCh:

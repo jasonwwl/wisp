@@ -18,11 +18,21 @@ import (
 // http.Server. Priority:
 //
 //  1. Caller-supplied TLSConfig.
-//  2. TLSCert / TLSKey filesystem paths.
-//  3. TLSAutoSelfSigned (development only).
-func resolveTLS(cfg Config) (*tls.Config, error) {
+//  2. ACME via autocert (Let's Encrypt-class CA).
+//  3. TLSCert / TLSKey filesystem paths.
+//  4. TLSAutoSelfSigned (development only).
+func resolveTLS(cfg Config, acme *acmeRuntime) (*tls.Config, error) {
 	if cfg.TLSConfig != nil {
 		return cfg.TLSConfig, nil
+	}
+	if acme != nil {
+		// autocert.Manager.GetCertificate handles both regular ServerName
+		// SNI and TLS-ALPN-01 challenges (via "acme-tls/1" ALPN).
+		return &tls.Config{
+			GetCertificate: acme.manager.GetCertificate,
+			NextProtos:     []string{"http/1.1", "acme-tls/1"},
+			MinVersion:     tls.VersionTLS12,
+		}, nil
 	}
 	if cfg.TLSCert != "" && cfg.TLSKey != "" {
 		cert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
@@ -38,7 +48,7 @@ func resolveTLS(cfg Config) (*tls.Config, error) {
 		}
 		return baseTLSConfig(cert), nil
 	}
-	return nil, errors.New("server: no TLS configured (set TLSCert/TLSKey, TLSConfig, or TLSAutoSelfSigned)")
+	return nil, errors.New("server: no TLS configured (set --acme, --cert/--key, --tls-config, or --tls-self-signed)")
 }
 
 // baseTLSConfig returns the shared *tls.Config we use for every wisp

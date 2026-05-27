@@ -28,6 +28,11 @@ type serveOpts struct {
 	tlsKey        string
 	tlsSelfSigned bool
 
+	acme         bool
+	acmeEmail    string
+	acmeCacheDir string
+	acmeHTTP     string
+
 	verbose bool
 }
 
@@ -40,9 +45,13 @@ func serveFlags(opts *serveOpts) *flag.FlagSet {
 	fs.StringVar(&opts.portRange, "port-range", "22000-22099", "public TCP port range for tunnels (reserved for forwarding milestone)")
 	fs.StringVar(&opts.decoyDir, "decoy-dir", "", "directory of static files to serve as the decoy site")
 	fs.StringVar(&opts.stateDir, "state-dir", defaultStateDir("server"), "directory for persistent state (reserved)")
-	fs.StringVar(&opts.tlsCert, "cert", "", "path to PEM certificate")
+	fs.StringVar(&opts.tlsCert, "cert", "", "path to PEM certificate (mutually exclusive with --acme, --tls-self-signed)")
 	fs.StringVar(&opts.tlsKey, "key", "", "path to PEM private key")
 	fs.BoolVar(&opts.tlsSelfSigned, "tls-self-signed", false, "generate an ephemeral self-signed cert (development only)")
+	fs.BoolVar(&opts.acme, "acme", false, "obtain and auto-renew a Let's Encrypt cert for --domain via ACME")
+	fs.StringVar(&opts.acmeEmail, "acme-email", "", "contact email for the ACME account (recommended)")
+	fs.StringVar(&opts.acmeCacheDir, "acme-cache", defaultStateDir("server")+"/acme-cache", "directory where issued certificates are persisted")
+	fs.StringVar(&opts.acmeHTTP, "acme-http", ":80", "address for the HTTP-01 challenge listener (set to empty to disable, then only TLS-ALPN-01 is used)")
 	fs.BoolVar(&opts.verbose, "verbose", false, "enable debug logging")
 	return fs
 }
@@ -60,8 +69,24 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 	if opts.token == "" {
 		return errors.New("--token is required (or set WISP_TOKEN)")
 	}
-	if !opts.tlsSelfSigned && (opts.tlsCert == "" || opts.tlsKey == "") {
-		return errors.New("provide --cert and --key, or --tls-self-signed for development")
+	tlsModes := 0
+	if opts.acme {
+		tlsModes++
+	}
+	if opts.tlsCert != "" || opts.tlsKey != "" {
+		if opts.tlsCert == "" || opts.tlsKey == "" {
+			return errors.New("--cert and --key must be provided together")
+		}
+		tlsModes++
+	}
+	if opts.tlsSelfSigned {
+		tlsModes++
+	}
+	if tlsModes == 0 {
+		return errors.New("pick a TLS mode: --acme (production), --cert/--key (self-managed), or --tls-self-signed (dev)")
+	}
+	if tlsModes > 1 {
+		return errors.New("--acme, --cert/--key, and --tls-self-signed are mutually exclusive")
 	}
 
 	logger := newLogger(stderr, opts.verbose)
@@ -76,6 +101,10 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 		TLSCert:           opts.tlsCert,
 		TLSKey:            opts.tlsKey,
 		TLSAutoSelfSigned: opts.tlsSelfSigned,
+		ACMEEnabled:       opts.acme,
+		ACMEEmail:         opts.acmeEmail,
+		ACMECacheDir:      opts.acmeCacheDir,
+		ACMEHTTPListen:    opts.acmeHTTP,
 		Logger:            logger,
 	})
 	if err != nil {
