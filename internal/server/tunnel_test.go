@@ -22,6 +22,32 @@ func newRecorder() *nonHijackerWriter {
 	return &nonHijackerWriter{ResponseRecorder: httptest.NewRecorder()}
 }
 
+// TestGrantTTLSec covers the TTL-grant policy, including the regression
+// where an over-ceiling request (e.g. --ttl 10h) was reset to the 1h
+// default instead of being clamped down to the 8h ceiling.
+func TestGrantTTLSec(t *testing.T) {
+	cases := []struct {
+		name      string
+		requested uint32
+		want      uint32
+	}{
+		{"zero takes default", 0, defaultTTLSec},
+		{"one second granted verbatim", 1, 1},
+		{"in-range granted verbatim", 2 * 60 * 60, 2 * 60 * 60},
+		{"exactly the ceiling", maxTTLSec, maxTTLSec},
+		{"just over ceiling clamps down", maxTTLSec + 1, maxTTLSec},
+		{"10h over-ask clamps to 8h, not 1h", 10 * 60 * 60, maxTTLSec},
+		{"max uint32 clamps down", ^uint32(0), maxTTLSec},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := grantTTLSec(c.requested); got != c.want {
+				t.Errorf("grantTTLSec(%d) = %d, want %d", c.requested, got, c.want)
+			}
+		})
+	}
+}
+
 // TestTunnel_NonHijackerLooksLike404 simulates an HTTP/2 (or any other
 // transport where Hijack is unavailable) request hitting the tunnel
 // endpoint with a valid token. The server must NOT return a default 200

@@ -200,15 +200,28 @@ func (s *Server) tunnelHandler(w http.ResponseWriter, r *http.Request) {
 	log.Info("tunnel torn down")
 }
 
+// grantTTLSec resolves a client-requested TTL (in seconds) to the TTL
+// the server will actually grant. A zero request takes the default; a
+// request beyond the ceiling is clamped down to maxTTLSec — NOT reset
+// to the default, which would surprisingly shrink an over-ask (e.g. a
+// 10h request) below what a smaller in-range ask would have gotten. Any
+// in-range request is granted verbatim.
+func grantTTLSec(requested uint32) uint32 {
+	switch {
+	case requested == 0:
+		return defaultTTLSec
+	case requested > maxTTLSec:
+		return maxTTLSec
+	default:
+		return requested
+	}
+}
+
 // acceptFresh allocates a port, binds a listener, and registers a fresh
 // entry with the session registry. On any failure it sends the
 // appropriate ack and returns a non-nil error.
 func (s *Server) acceptFresh(wsc *wsraw.Conn, hello *protocol.Hello, log *slog.Logger) (*sessionEntry, net.Listener, int, error) {
-	grantedTTL := hello.RequestedTTL
-	if grantedTTL == 0 || grantedTTL > maxTTLSec {
-		grantedTTL = defaultTTLSec
-	}
-	ttl := time.Duration(grantedTTL) * time.Second
+	ttl := time.Duration(grantTTLSec(hello.RequestedTTL)) * time.Second
 
 	listener, port, err := s.bindFreshListener(log)
 	if err != nil {
